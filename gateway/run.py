@@ -1706,6 +1706,26 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+_HOME_CHANNEL_NOTICE_EXEMPT_PLATFORMS = frozenset({"local", "webhook", "queue"})
+
+
+def _should_send_home_channel_notice(source: Any, history) -> bool:
+    """Return whether first-contact home-channel onboarding should be sent.
+
+    Queue is a control-plane transport: replies are routed by queue target, not
+    by a user-facing home channel. Emitting the generic home-channel notice on a
+    queue handoff turns the system warning into another handoff reply and can
+    create duplicate/noisy queue rows.
+    """
+    if history:
+        return False
+    platform = getattr(source, "platform", None)
+    if not platform:
+        return False
+    platform_value = getattr(platform, "value", str(platform)).lower()
+    return platform_value not in _HOME_CHANNEL_NOTICE_EXEMPT_PLATFORMS
+
+
 # Sentinel placed into _running_agents immediately when a session starts
 # processing, *before* any await.  Prevents a second message for the same
 # session from bypassing the "already running" guard during the async gap
@@ -10495,9 +10515,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 context_prompt += _intro_note
         
-        # One-time prompt if no home channel is set for this platform
-        # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
-        if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
+        # One-time prompt if no home channel is set for this platform.
+        # Queue/webhook/local are control-plane or direct-delivery transports;
+        # they do not need a user-facing home channel and must not echo this
+        # onboarding notice back into their delivery path.
+        if _should_send_home_channel_notice(source, history):
             platform_name = source.platform.value
             env_key = _home_target_env_var(platform_name)
             if not os.getenv(env_key):
