@@ -53,6 +53,12 @@ MIN_POLL_INTERVAL_SECONDS = 0.2
 # 채널로의 응답이 handoff로 오분류되지 않는다. slack_bridge 센더는 raw 슬랙
 # 채널만 발송 허용(allowed_channel_ids 게이트)하므로 outbox 삽입 직전 접두를 벗긴다.
 _REPLY_CHANNEL_PREFIX = "queue:"
+# handoff 응답은 다시 상대에게 큐로 보내되, 상대가 그 답에 또 답하지 않도록
+# 별도 합성채널로 표시한다. 수신측은 이 채널을 no-reply sink로 라우팅한다.
+_HANDOFF_REPLY_TARGET_PREFIX = "handoff-reply:"
+_HANDOFF_CHANNEL_PREFIX = f"{_REPLY_CHANNEL_PREFIX}handoff:"
+_HANDOFF_REPLY_CHANNEL_PREFIX = f"{_REPLY_CHANNEL_PREFIX}handoff-reply:"
+_NO_REPLY_CHANNEL = f"{_REPLY_CHANNEL_PREFIX}no-reply"
 # 아웃바운드 handoff의 합성 event_ts/thread_ts 접두(슬랙 ts와 충돌 없는 고유값).
 _HANDOFF_EVENT_PREFIX = "qho-"
 # raw 슬랙 채널ID(C/G/D + 영숫자) 패턴 — 에이전트 키가 아니라 채널ID가 큐
@@ -67,6 +73,25 @@ def _normalize_reply_channel(channel: str) -> str:
     if channel.startswith(_REPLY_CHANNEL_PREFIX):
         return channel
     return _REPLY_CHANNEL_PREFIX + channel
+
+
+def _parse_handoff_channel(channel: str, *, reply: bool = False) -> tuple[str, str] | None:
+    """합성 handoff 채널이면 (sender, target)을 반환한다.
+
+    일반 handoff: ``queue:handoff:<sender>-><target>``
+    handoff 응답: ``queue:handoff-reply:<sender>-><target>``
+    """
+    prefix = _HANDOFF_REPLY_CHANNEL_PREFIX if reply else _HANDOFF_CHANNEL_PREFIX
+    channel = (channel or "").strip()
+    if not channel.startswith(prefix):
+        return None
+    rest = channel[len(prefix):]
+    if "->" not in rest:
+        return None
+    sender, target = (part.strip() for part in rest.split("->", 1))
+    if not sender or not target:
+        return None
+    return sender, target
 
 
 def _route_and_insert(repo, agent: str, target: str, content: str, thread_hint) -> Dict[str, Any]:
@@ -89,6 +114,11 @@ def _route_and_insert(repo, agent: str, target: str, content: str, thread_hint) 
     if not target:
         return {"error": "empty target"}
 
+    if target == _NO_REPLY_CHANNEL:
+        # handoff-reply 수신 후 모델이 답을 만들어도 여기서 성공 no-op 처리해
+        # "답의 답" 무한왕복을 끊는다. 성공으로 반환해야 원 inbound가 done 된다.
+        return {"success": True, "message_id": "queue:no-reply"}
+
     if target.startswith(_REPLY_CHANNEL_PREFIX):
         channel = target[len(_REPLY_CHANNEL_PREFIX):]
         row_id = repo.insert_outbox(
@@ -98,6 +128,13 @@ def _route_and_insert(repo, agent: str, target: str, content: str, thread_hint) 
             created_by=f"queue:{agent}",
         )
         return {"success": True, "message_id": str(row_id)}
+
+    is_handoff_reply = False
+    if target.startswith(_HANDOFF_REPLY_TARGET_PREFIX):
+        is_handoff_reply = True
+        target = target[len(_HANDOFF_REPLY_TARGET_PREFIX):].strip()
+        if not target:
+            return {"error": "empty handoff reply target"}
 
     if target == agent:
         # 자기 자신에게 handoff = 무한 루프 위험 → 삽입 없이 거부.
@@ -114,7 +151,11 @@ def _route_and_insert(repo, agent: str, target: str, content: str, thread_hint) 
     thread_ts = str(thread_hint) if thread_hint else f"{_HANDOFF_EVENT_PREFIX}{uuid.uuid4()}"
     inserted = repo.insert_inbox(
         slack_event_ts=event_ts,
-        channel_id=f"{_REPLY_CHANNEL_PREFIX}handoff:{agent}->{target}",
+        channel_id=(
+            f"{_HANDOFF_REPLY_CHANNEL_PREFIX}{agent}->{target}"
+            if is_handoff_reply
+            else f"{_HANDOFF_CHANNEL_PREFIX}{agent}->{target}"
+        ),
         thread_ts=thread_ts,
         slack_user_id=agent,
         text=content,
@@ -362,10 +403,23 @@ class QueueAdapter(BasePlatformAdapter):
                 self._repo.mark_inbox_error, turn.inbox_id, "sender not allowed"
             )
             return False
-        # 접두 규약 방어: 자동 응답이 handoff로 오분류되지 않게 채널을 'queue:'로
-        # 정규화한다(멱등). send()가 이 접두를 보고 outbox로 라우팅하며, 삽입
-        # 직전 접두를 벗겨 raw 슬랙 채널로 발송한다.
-        reply_channel = _normalize_reply_channel(turn.channel_id)
+        handoff = _parse_handoff_channel(turn.channel_id)
+        handoff_reply = _parse_handoff_channel(turn.channel_id, reply=True)
+        if handoff_reply:
+            # handoff 응답을 받은 쪽이 또 답하면 무한 왕복이 된다. 메시지는
+            # 정상 처리하되, 모델 응답은 no-op sink로 라우팅해 원 row를 done으로
+            # 마감하고 추가 큐 row/outbox를 만들지 않는다.
+            reply_channel = _NO_REPLY_CHANNEL
+        elif handoff:
+            # 큐 handoff로 받은 턴의 답은 슬랙 outbox가 아니라 발신자 큐로 보낸다.
+            # send()는 이 특수 target을 handoff-reply row로 삽입하고, 수신측은
+            # 위 no-reply 분기로 "답의 답"을 끊는다.
+            reply_channel = f"{_HANDOFF_REPLY_TARGET_PREFIX}{turn.slack_user_id}"
+        else:
+            # 접두 규약 방어: 자동 응답이 handoff로 오분류되지 않게 채널을 'queue:'로
+            # 정규화한다(멱등). send()가 이 접두를 보고 outbox로 라우팅하며, 삽입
+            # 직전 접두를 벗겨 raw 슬랙 채널로 발송한다.
+            reply_channel = _normalize_reply_channel(turn.channel_id)
         source = self.build_source(
             chat_id=reply_channel,
             chat_name=reply_channel,

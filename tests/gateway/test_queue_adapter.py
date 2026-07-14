@@ -636,6 +636,17 @@ class M1TestBase(QueueAdapterTestBase):
         finally:
             con.close()
 
+    def inbox_rows(self):
+        con = sqlite3.connect(self.db_path)
+        con.row_factory = sqlite3.Row
+        try:
+            return con.execute(
+                "SELECT slack_event_ts, channel_id, thread_ts, slack_user_id,"
+                " text, target, status FROM slack_inbox ORDER BY id"
+            ).fetchall()
+        finally:
+            con.close()
+
     def outbox_rows(self):
         con = sqlite3.connect(self.db_path)
         con.row_factory = sqlite3.Row
@@ -873,3 +884,85 @@ class TestM1AutoReplyPipelineStaysOutbox(M1TestBase):
         self.assertIn("퐁 응답이야", rows[0]["text"])
         # 새 handoff inbox row 없음 — 원본 인바운드 1건만 남는다.
         self.assertEqual(self.inbox_count(), 1)
+
+
+class TestM2DHandoffReplyRouting(M1TestBase):
+    """M2-D: 큐 handoff 인바운드의 답은 발신자 큐로, 답의 답은 no-op으로 수렴."""
+
+    async def _wait_done(self, event_ts):
+        for _ in range(200):  # 최대 ~10초
+            row = self.inbox_row(event_ts)
+            if row and row["status"] == "done":
+                return
+            await asyncio.sleep(0.05)
+        self.fail(f"inbox row did not finish: {event_ts}")
+
+    def test_handoff_inbound_response_routes_to_sender_queue_not_outbox(self):
+        repo = self.make_repo()
+        repo.insert_inbox(
+            slack_event_ts="m2d-in-1",
+            channel_id="queue:handoff:chadol->chami",
+            thread_ts="m2d-thread-1",
+            slack_user_id="chadol",
+            text="살아있어?",
+            target="chami",
+        )
+
+        adapter = self.make_adapter()
+        adapter._repo = repo
+
+        async def handler(event):
+            self.assertEqual(event.source.chat_id, "handoff-reply:chadol")
+            return "살아있어."
+
+        adapter.set_message_handler(handler)
+
+        async def scenario():
+            self.assertTrue(await adapter._poll_once())
+            await self._wait_done("m2d-in-1")
+            await asyncio.sleep(0.2)
+
+        asyncio.run(scenario())
+
+        self.assertEqual(self.inbox_row("m2d-in-1")["status"], "done")
+        rows = self.inbox_by_target("chadol")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["slack_user_id"], "chami")
+        self.assertEqual(rows[0]["text"], "살아있어.")
+        self.assertEqual(rows[0]["thread_ts"], "m2d-thread-1")
+        self.assertEqual(rows[0]["channel_id"], "queue:handoff-reply:chami->chadol")
+        # handoff 합성채널이 slack_outbox로 새면 안 된다.
+        self.assertEqual(len(self.outbox_rows()), 0)
+
+    def test_handoff_reply_inbound_suppresses_answer_to_prevent_loop(self):
+        repo = self.make_repo()
+        repo.insert_inbox(
+            slack_event_ts="m2d-reply-1",
+            channel_id="queue:handoff-reply:chami->chadol",
+            thread_ts="m2d-thread-1",
+            slack_user_id="chami",
+            text="살아있어.",
+            target="chadol",
+        )
+
+        adapter = self.make_adapter(env_overrides={"QUEUE_AGENT": "chadol"})
+        adapter._repo = repo
+
+        async def handler(event):
+            self.assertEqual(event.source.chat_id, "queue:no-reply")
+            return "나도 살아있어."  # 이 응답은 no-op success로 삼켜져야 한다.
+
+        adapter.set_message_handler(handler)
+
+        async def scenario():
+            self.assertTrue(await adapter._poll_once())
+            await self._wait_done("m2d-reply-1")
+            await asyncio.sleep(0.2)
+
+        asyncio.run(scenario())
+
+        self.assertEqual(self.inbox_row("m2d-reply-1")["status"], "done")
+        # 답의 답으로 chami 대상 새 row가 생기면 무한루프 위험이다.
+        self.assertEqual(len(self.inbox_by_target("chami")), 0)
+        self.assertEqual(self.inbox_count(), 1)
+        self.assertEqual(len(self.outbox_rows()), 0)
