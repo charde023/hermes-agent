@@ -817,6 +817,23 @@ class TestM1DefensiveTargets(M1TestBase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["channel_id"], "C0B69KP8G2J")
 
+    def test_synthetic_handoff_channel_target_is_success_noop(self):
+        # 합성 handoff 채널은 슬랙 발신 채널이 아니다. 코어 후처리/스트리밍 경로가
+        # source.chat_id를 그대로 다시 send해도 outbox에 죽은 row를 만들지 않는다.
+        adapter = self.make_adapter()
+        adapter._repo = self.make_repo()
+
+        for target in (
+            "queue:handoff:chadol->chami",
+            "queue:handoff-reply:chami->chadol",
+        ):
+            result = asyncio.run(adapter.send(target, "중복 발신 시도"))
+            self.assertTrue(result.success)
+            self.assertEqual(result.message_id, "queue:handoff-synthetic-noop")
+
+        self.assertEqual(self.inbox_count(), 0)
+        self.assertEqual(len(self.outbox_rows()), 0)
+
 
 class TestM1DuplicateHandoff(M1TestBase):
     """M1-T6: handoff insert_inbox 중복 event_ts → success=False."""

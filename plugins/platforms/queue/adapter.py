@@ -119,6 +119,13 @@ def _route_and_insert(repo, agent: str, target: str, content: str, thread_hint) 
         # "답의 답" 무한왕복을 끊는다. 성공으로 반환해야 원 inbound가 done 된다.
         return {"success": True, "message_id": "queue:no-reply"}
 
+    if target.startswith(_HANDOFF_CHANNEL_PREFIX) or target.startswith(_HANDOFF_REPLY_CHANNEL_PREFIX):
+        # 합성 handoff 채널은 슬랙 발신 채널이 아니다. 코어/스트리밍/후처리 경로가
+        # 원 source.chat_id(예: queue:handoff-reply:chami->chadol)로 한 번 더
+        # deliver를 시도해도 outbox에 넣지 말고 성공 no-op으로 삼킨다. 실제 답은
+        # _dispatch_turn의 handoff-reply:<sender> 경로가 이미 상대 inbox로 보냈다.
+        return {"success": True, "message_id": "queue:handoff-synthetic-noop"}
+
     if target.startswith(_REPLY_CHANNEL_PREFIX):
         channel = target[len(_REPLY_CHANNEL_PREFIX):]
         row_id = repo.insert_outbox(
