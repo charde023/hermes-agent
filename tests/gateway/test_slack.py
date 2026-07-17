@@ -736,9 +736,9 @@ class TestSlackProxyBehavior:
                 created_clients.append(self)
 
         class FakeApp:
-            def __init__(self, token):
-                self.token = token
-                self.client = FakeWebClient(token)
+            def __init__(self, authorize):
+                self.authorize = authorize
+                self.client = MagicMock(proxy="constructor-default")
                 self.registered_events = []
                 self.registered_commands = []
                 self.registered_actions = []
@@ -781,7 +781,15 @@ class TestSlackProxyBehavior:
             async def close_async(self):
                 return None
 
-        config = PlatformConfig(enabled=True, token="xoxb-primary,xoxb-secondary")
+        config = PlatformConfig(
+            enabled=True,
+            token="xoxb-primary",
+            extra={
+                "workspace_bot_token_refs": {
+                    "T_secondary": "env://TEST_SLACK_BOT_TOKEN_SECONDARY",
+                }
+            },
+        )
         adapter = SlackAdapter(config)
 
         with (
@@ -793,7 +801,14 @@ class TestSlackProxyBehavior:
                 "_resolve_slack_proxy_url",
                 return_value="http://proxy.example.com:3128",
             ),
-            patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}, clear=False),
+            patch.dict(
+                os.environ,
+                {
+                    "SLACK_APP_TOKEN": "xapp-fake",
+                    "TEST_SLACK_BOT_TOKEN_SECONDARY": "xoxb-secondary",
+                },
+                clear=False,
+            ),
             patch("gateway.status.acquire_scoped_lock", return_value=(True, None)),
             patch("asyncio.create_task", side_effect=_fake_create_task),
         ):
@@ -830,9 +845,9 @@ class TestSlackProxyBehavior:
                 created_clients.append(self)
 
         class FakeApp:
-            def __init__(self, token):
-                self.token = token
-                self.client = FakeWebClient(token)
+            def __init__(self, authorize):
+                self.authorize = authorize
+                self.client = MagicMock(proxy="constructor-default")
                 self.registered_events = []
                 self.registered_commands = []
                 self.registered_actions = []
@@ -1012,7 +1027,11 @@ class TestSendDocument:
             metadata={"thread_id": "1234567890.123456"},
         )
 
-        assert "1234567890.123456" in adapter._bot_message_ts
+        assert (
+            "_legacy",
+            "C123",
+            "1234567890.123456",
+        ) in adapter._bot_message_ts
 
     @pytest.mark.asyncio
     async def test_send_document_retries_transient_upload_error(
@@ -2266,7 +2285,7 @@ class TestSendTyping:
             thread_ts="parent_ts",
             status="",
         )
-        assert "C123" not in adapter._active_status_threads
+        assert ("_legacy", "C123", "parent_ts") not in adapter._active_status_threads
 
     @pytest.mark.asyncio
     async def test_stop_typing_noop_without_tracked_thread(self, adapter):
@@ -2278,7 +2297,7 @@ class TestSendTyping:
 
     @pytest.mark.asyncio
     async def test_stop_typing_handles_api_error_gracefully(self, adapter):
-        adapter._active_status_threads["C123"] = "parent_ts"
+        adapter._active_status_threads[("_legacy", "C123", "parent_ts")] = "parent_ts"
         adapter._app.client.assistant_threads_setStatus = AsyncMock(
             side_effect=Exception("missing_scope")
         )
@@ -2290,7 +2309,7 @@ class TestSendTyping:
             thread_ts="parent_ts",
             status="",
         )
-        assert "C123" not in adapter._active_status_threads
+        assert ("_legacy", "C123", "parent_ts") not in adapter._active_status_threads
 
     @pytest.mark.asyncio
     async def test_send_clears_status_after_final_post(self, adapter):
@@ -2298,7 +2317,7 @@ class TestSendTyping:
             return_value={"ts": "reply_ts"}
         )
         adapter._app.client.assistant_threads_setStatus = AsyncMock()
-        adapter._active_status_threads["C123"] = "parent_ts"
+        adapter._active_status_threads[("_legacy", "C123", "parent_ts")] = "parent_ts"
 
         result = await adapter.send("C123", "done", metadata={"thread_id": "parent_ts"})
 
@@ -2309,13 +2328,13 @@ class TestSendTyping:
             thread_ts="parent_ts",
             status="",
         )
-        assert "C123" not in adapter._active_status_threads
+        assert ("_legacy", "C123", "parent_ts") not in adapter._active_status_threads
 
     @pytest.mark.asyncio
     async def test_streaming_final_edit_clears_status(self, adapter):
         adapter._app.client.chat_update = AsyncMock()
         adapter._app.client.assistant_threads_setStatus = AsyncMock()
-        adapter._active_status_threads["C123"] = "parent_ts"
+        adapter._active_status_threads[("_legacy", "C123", "parent_ts")] = "parent_ts"
 
         result = await adapter.edit_message(
             "C123",
@@ -2335,13 +2354,13 @@ class TestSendTyping:
             thread_ts="parent_ts",
             status="",
         )
-        assert "C123" not in adapter._active_status_threads
+        assert ("_legacy", "C123", "parent_ts") not in adapter._active_status_threads
 
     @pytest.mark.asyncio
     async def test_streaming_intermediate_edit_keeps_status(self, adapter):
         adapter._app.client.chat_update = AsyncMock()
         adapter._app.client.assistant_threads_setStatus = AsyncMock()
-        adapter._active_status_threads["C123"] = "parent_ts"
+        adapter._active_status_threads[("_legacy", "C123", "parent_ts")] = "parent_ts"
 
         result = await adapter.edit_message(
             "C123",
@@ -2352,7 +2371,10 @@ class TestSendTyping:
 
         assert result.success
         adapter._app.client.assistant_threads_setStatus.assert_not_called()
-        assert adapter._active_status_threads["C123"] == "parent_ts"
+        assert (
+            adapter._active_status_threads[("_legacy", "C123", "parent_ts")]
+            == "parent_ts"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2808,7 +2830,8 @@ class TestReactions:
         await adapter._handle_slack_message(event)
 
         # _handle_slack_message should register the message for reactions
-        assert "1234567890.000001" in adapter._reacting_message_ids
+        message_key = ("_legacy", "C123", "1234567890.000001")
+        assert message_key in adapter._reacting_message_ids
 
         # Simulate the base class calling on_processing_start
         from gateway.platforms.base import MessageEvent, MessageType, SessionSource
@@ -2845,7 +2868,7 @@ class TestReactions:
         assert remove_calls[0].kwargs["name"] == "eyes"
 
         # Message ID should be cleaned up
-        assert "1234567890.000001" not in adapter._reacting_message_ids
+        assert message_key not in adapter._reacting_message_ids
 
     @pytest.mark.asyncio
     async def test_reactions_failure_outcome(self, adapter):
@@ -2867,7 +2890,9 @@ class TestReactions:
             chat_type="dm",
             user_id="U_USER",
         )
-        adapter._reacting_message_ids.add("1234567890.000002")
+        adapter._reacting_message_ids.add(
+            ("_legacy", "C123", "1234567890.000002")
+        )
         msg_event = MessageEvent(
             text="hello",
             message_type=MessageType.TEXT,
@@ -2902,7 +2927,11 @@ class TestReactions:
         await adapter._handle_slack_message(event)
 
         # Should NOT register for reactions when not mentioned in a channel
-        assert "1234567890.000003" not in adapter._reacting_message_ids
+        assert (
+            "_legacy",
+            "C123",
+            "1234567890.000003",
+        ) not in adapter._reacting_message_ids
         adapter._app.client.reactions_add.assert_not_called()
         adapter._app.client.reactions_remove.assert_not_called()
 
@@ -2926,7 +2955,11 @@ class TestReactions:
         await adapter._handle_slack_message(event)
 
         # Should NOT register for reactions when toggle is off
-        assert "1234567890.000004" not in adapter._reacting_message_ids
+        assert (
+            "_legacy",
+            "C123",
+            "1234567890.000004",
+        ) not in adapter._reacting_message_ids
 
         # Hooks should also be no-ops when disabled
         from gateway.platforms.base import (
@@ -2950,7 +2983,9 @@ class TestReactions:
             message_id="1234567890.000004",
         )
         # Force-add to verify hooks respect the toggle independently
-        adapter._reacting_message_ids.add("1234567890.000004")
+        adapter._reacting_message_ids.add(
+            ("_legacy", "C123", "1234567890.000004")
+        )
         await adapter.on_processing_start(msg_event)
         await adapter.on_processing_complete(msg_event, ProcessingOutcome.SUCCESS)
 
@@ -2979,6 +3014,7 @@ class TestThreadReplyHandling:
         store._ensure_loaded = MagicMock()
         store.config = MagicMock()
         store.config.group_sessions_per_user = True
+        store.config.thread_sessions_per_user = False
         return store
 
     @pytest.fixture()
@@ -2990,6 +3026,8 @@ class TestThreadReplyHandling:
         a._app.client = AsyncMock()
         a._bot_user_id = "U_BOT"
         a._team_bot_user_ids = {"T_TEAM": "U_BOT"}
+        a._team_clients = {"T_TEAM": a._app.client}
+        a._channel_team = {"D123": "T_TEAM"}
         a._running = True
         a.handle_message = AsyncMock()
         a.set_session_store(mock_session_store)
@@ -3020,7 +3058,7 @@ class TestThreadReplyHandling:
     ):
         """Thread replies without mention should be processed if there's an active session."""
         # Simulate an active session for this thread
-        session_key = "agent:main:slack:group:C123:123.000:U_USER"
+        session_key = "agent:main:slack:group:C123:123.000:scope:T_TEAM"
         mock_session_store._entries = {session_key: MagicMock()}
 
         event = {
@@ -3128,6 +3166,8 @@ class TestAssistantThreadLifecycle:
         a._app.client = AsyncMock()
         a._bot_user_id = "U_BOT"
         a._team_bot_user_ids = {"T_TEAM": "U_BOT"}
+        a._team_clients = {"T_TEAM": a._app.client}
+        a._channel_team = {"D123": "T_TEAM"}
         a._running = True
         a.handle_message = AsyncMock()
         a.set_session_store(mock_session_store)
@@ -3151,7 +3191,7 @@ class TestAssistantThreadLifecycle:
         await assistant_adapter._handle_assistant_thread_lifecycle_event(event)
 
         assert (
-            assistant_adapter._assistant_threads[("D123", "171.000")]["user_id"]
+            assistant_adapter._assistant_threads[("T_TEAM", "D123", "171.000")]["user_id"]
             == "U_USER"
         )
         mock_session_store.get_or_create_session.assert_called_once()
@@ -3161,12 +3201,13 @@ class TestAssistantThreadLifecycle:
         assert source.user_id == "U_USER"
         assert source.thread_id == "171.000"
         assert source.chat_topic == "C_ORIGIN"
+        assert source.scope_id == "T_TEAM"
 
     @pytest.mark.asyncio
     async def test_message_uses_cached_assistant_thread_identity(
         self, assistant_adapter
     ):
-        assistant_adapter._assistant_threads[("D123", "171.000")] = {
+        assistant_adapter._assistant_threads[("T_TEAM", "D123", "171.000")] = {
             "channel_id": "D123",
             "thread_ts": "171.000",
             "user_id": "U_USER",
@@ -3218,7 +3259,7 @@ class TestAssistantThreadLifecycle:
         )
         assert len(assistant_adapter._assistant_threads) <= 10
         # The newest entry must survive eviction
-        assert ("D999", "999.000") in assistant_adapter._assistant_threads
+        assert ("_legacy", "D999", "999.000") in assistant_adapter._assistant_threads
 
 
 # ---------------------------------------------------------------------------
@@ -3927,12 +3968,13 @@ class TestSlashEphemeralAck:
             "text": "follow-up question",
             "user_id": "U_SLASH",
             "channel_id": "C_SLASH",
+            "trigger_id": "trigger-slash",
             "response_url": "https://hooks.slack.com/commands/T123/456/abc",
         }
         await adapter._handle_slash_command(command)
 
-        # The context should be stashed under (channel_id, user_id).
-        key = ("C_SLASH", "U_SLASH")
+        # The context is workspace-scoped to avoid cross-workspace collisions.
+        key = ("_legacy", "C_SLASH", "U_SLASH", "trigger-slash")
         assert key in adapter._slash_command_contexts
         ctx = adapter._slash_command_contexts[key]
         assert ctx["response_url"] == "https://hooks.slack.com/commands/T123/456/abc"
@@ -3955,13 +3997,19 @@ class TestSlashEphemeralAck:
     async def test_pop_slash_context_returns_and_removes(self, adapter):
         """_pop_slash_context returns the context and removes it."""
         import time
+        from plugins.platforms.slack.adapter import _slash_context_key
 
-        adapter._slash_command_contexts[("C1", "U1")] = {
+        key = ("_legacy", "C1", "U1", "trigger-one")
+        adapter._slash_command_contexts[key] = {
             "response_url": "https://hooks.slack.com/test",
             "ts": time.monotonic(),
         }
 
-        ctx = adapter._pop_slash_context("C1")
+        token = _slash_context_key.set(key)
+        try:
+            ctx = adapter._pop_slash_context("C1")
+        finally:
+            _slash_context_key.reset(token)
         assert ctx is not None
         assert ctx["response_url"] == "https://hooks.slack.com/test"
         # Must be removed after pop
@@ -3978,7 +4026,7 @@ class TestSlashEphemeralAck:
         """Stale contexts older than TTL are cleaned up."""
         import time
 
-        adapter._slash_command_contexts[("C1", "U1")] = {
+        adapter._slash_command_contexts[("_legacy", "C1", "U1", "stale")] = {
             "response_url": "https://hooks.slack.com/stale",
             "ts": time.monotonic() - adapter._SLASH_CTX_TTL - 1,
         }
@@ -3991,8 +4039,10 @@ class TestSlashEphemeralAck:
     async def test_send_uses_response_url_when_context_exists(self, adapter):
         """send() should POST to response_url for slash command replies."""
         import time
+        from plugins.platforms.slack.adapter import _slash_context_key
 
-        adapter._slash_command_contexts[("C_SLASH", "U_SLASH")] = {
+        key = ("_legacy", "C_SLASH", "U_SLASH", "trigger-send")
+        adapter._slash_command_contexts[key] = {
             "response_url": "https://hooks.slack.com/commands/T123/456/abc",
             "ts": time.monotonic(),
         }
@@ -4010,7 +4060,11 @@ class TestSlashEphemeralAck:
         with patch(
             "plugins.platforms.slack.adapter.aiohttp.ClientSession", return_value=mock_session
         ):
-            result = await adapter.send("C_SLASH", "Queued for the next turn.")
+            token = _slash_context_key.set(key)
+            try:
+                result = await adapter.send("C_SLASH", "Queued for the next turn.")
+            finally:
+                _slash_context_key.reset(token)
 
         assert result.success is True
         # Verify response_url was POSTed to
@@ -4040,8 +4094,10 @@ class TestSlashEphemeralAck:
     async def test_send_slash_ephemeral_fallback_on_post_failure(self, adapter):
         """_send_slash_ephemeral returns success=True even if POST fails."""
         import time
+        from plugins.platforms.slack.adapter import _slash_context_key
 
-        adapter._slash_command_contexts[("C1", "U1")] = {
+        key = ("_legacy", "C1", "U1", "trigger-failure")
+        adapter._slash_command_contexts[key] = {
             "response_url": "https://hooks.slack.com/commands/bad",
             "ts": time.monotonic(),
         }
@@ -4060,7 +4116,11 @@ class TestSlashEphemeralAck:
         with patch(
             "plugins.platforms.slack.adapter.aiohttp.ClientSession", return_value=mock_session
         ):
-            result = await adapter.send("C1", "Some response")
+            token = _slash_context_key.set(key)
+            try:
+                result = await adapter.send("C1", "Some response")
+            finally:
+                _slash_context_key.reset(token)
 
         # Still success — the user saw the initial ack already
         assert result.success is True
@@ -4069,8 +4129,10 @@ class TestSlashEphemeralAck:
     async def test_send_slash_ephemeral_fallback_on_exception(self, adapter):
         """_send_slash_ephemeral returns success=True even if aiohttp raises."""
         import time
+        from plugins.platforms.slack.adapter import _slash_context_key
 
-        adapter._slash_command_contexts[("C1", "U1")] = {
+        key = ("_legacy", "C1", "U1", "trigger-timeout")
+        adapter._slash_command_contexts[key] = {
             "response_url": "https://hooks.slack.com/commands/timeout",
             "ts": time.monotonic(),
         }
@@ -4083,7 +4145,11 @@ class TestSlashEphemeralAck:
         with patch(
             "plugins.platforms.slack.adapter.aiohttp.ClientSession", return_value=mock_session
         ):
-            result = await adapter.send("C1", "Some response")
+            token = _slash_context_key.set(key)
+            try:
+                result = await adapter.send("C1", "Some response")
+            finally:
+                _slash_context_key.reset(token)
 
         assert result.success is True
 
@@ -4095,6 +4161,7 @@ class TestSlashEphemeralAck:
             "text": "do something",
             "user_id": "U_Q",
             "channel_id": "C_Q",
+            "trigger_id": "trigger-q",
             "response_url": "https://hooks.slack.com/commands/T1/2/q",
         }
         await adapter._handle_slash_command(command)
@@ -4106,7 +4173,12 @@ class TestSlashEphemeralAck:
         assert event.message_type == MessageType.COMMAND
 
         # 2. Context stashed for ephemeral routing
-        assert ("C_Q", "U_Q") in adapter._slash_command_contexts
+        assert (
+            "_legacy",
+            "C_Q",
+            "U_Q",
+            "trigger-q",
+        ) in adapter._slash_command_contexts
 
     @pytest.mark.asyncio
     async def test_legacy_hermes_slash_stashes_context(self, adapter):
@@ -4116,12 +4188,18 @@ class TestSlashEphemeralAck:
             "text": "help",
             "user_id": "U_H",
             "channel_id": "C_H",
+            "trigger_id": "trigger-hermes",
             "response_url": "https://hooks.slack.com/commands/T1/3/h",
         }
         await adapter._handle_slash_command(command)
 
         adapter.handle_message.assert_called_once()
-        assert ("C_H", "U_H") in adapter._slash_command_contexts
+        assert (
+            "_legacy",
+            "C_H",
+            "U_H",
+            "trigger-hermes",
+        ) in adapter._slash_command_contexts
 
     @pytest.mark.asyncio
     async def test_freeform_hermes_question_does_not_stash_context(self, adapter):
@@ -4147,60 +4225,115 @@ class TestSlashEphemeralAck:
     async def test_concurrent_users_same_channel_isolates_contexts(self, adapter):
         """Two users slash on the same channel — each gets their own context."""
         import time
-        from plugins.platforms.slack.adapter import _slash_user_id
+        from plugins.platforms.slack.adapter import _slash_context_key
 
         # Simulate two users stashing contexts on the same channel.
-        adapter._slash_command_contexts[("C_SHARED", "U_ALICE")] = {
+        alice_key = ("_legacy", "C_SHARED", "U_ALICE", "trigger-alice")
+        bob_key = ("_legacy", "C_SHARED", "U_BOB", "trigger-bob")
+        adapter._slash_command_contexts[alice_key] = {
             "response_url": "https://hooks.slack.com/alice",
             "ts": time.monotonic(),
         }
-        adapter._slash_command_contexts[("C_SHARED", "U_BOB")] = {
+        adapter._slash_command_contexts[bob_key] = {
             "response_url": "https://hooks.slack.com/bob",
             "ts": time.monotonic(),
         }
 
-        # Alice's send() — ContextVar set to Alice's user_id.
-        token = _slash_user_id.set("U_ALICE")
+        # Alice's send() — ContextVar carries Alice's full invocation key.
+        token = _slash_context_key.set(alice_key)
         try:
             ctx = adapter._pop_slash_context("C_SHARED")
         finally:
-            _slash_user_id.reset(token)
+            _slash_context_key.reset(token)
 
         assert ctx is not None
         assert ctx["response_url"] == "https://hooks.slack.com/alice"
         # Bob's context must still be there.
-        assert ("C_SHARED", "U_BOB") in adapter._slash_command_contexts
+        assert bob_key in adapter._slash_command_contexts
         assert len(adapter._slash_command_contexts) == 1
 
-        # Bob's send() — ContextVar set to Bob's user_id.
-        token = _slash_user_id.set("U_BOB")
+        # Bob's send() — ContextVar carries Bob's full invocation key.
+        token = _slash_context_key.set(bob_key)
         try:
             ctx = adapter._pop_slash_context("C_SHARED")
         finally:
-            _slash_user_id.reset(token)
+            _slash_context_key.reset(token)
 
         assert ctx is not None
         assert ctx["response_url"] == "https://hooks.slack.com/bob"
         assert len(adapter._slash_command_contexts) == 0
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("with_trigger_id", [True, False])
+    async def test_concurrent_same_user_slashes_keep_exact_response_urls(
+        self, adapter, with_trigger_id
+    ):
+        """Concurrent invocations by one user must not overwrite each other."""
+        both_started = asyncio.Event()
+        started = 0
+        routed = {}
+
+        async def capture_response_context(event):
+            nonlocal started
+            started += 1
+            if started == 2:
+                both_started.set()
+            await both_started.wait()
+            context = adapter._pop_slash_context(
+                event.source.chat_id,
+                metadata={"scope_id": "T_SHARED"},
+            )
+            routed[event.text] = context["response_url"] if context else None
+
+        adapter.handle_message = capture_response_context
+        commands = [
+            {
+                "command": "/q",
+                "text": "first",
+                "user_id": "U_SHARED",
+                "channel_id": "C_SHARED",
+                "team_id": "T_SHARED",
+                "response_url": "https://hooks.slack.com/first",
+            },
+            {
+                "command": "/q",
+                "text": "second",
+                "user_id": "U_SHARED",
+                "channel_id": "C_SHARED",
+                "team_id": "T_SHARED",
+                "response_url": "https://hooks.slack.com/second",
+            },
+        ]
+        if with_trigger_id:
+            commands[0]["trigger_id"] = "trigger-first"
+            commands[1]["trigger_id"] = "trigger-second"
+
+        await asyncio.gather(
+            *(adapter._handle_slash_command(command) for command in commands)
+        )
+
+        assert routed == {
+            "/q first": "https://hooks.slack.com/first",
+            "/q second": "https://hooks.slack.com/second",
+        }
+        assert adapter._slash_command_contexts == {}
+
+    @pytest.mark.asyncio
     async def test_no_contextvar_does_not_match_any_context(self, adapter):
         """send() without ContextVar (non-slash path) must not steal contexts."""
         import time
-        from plugins.platforms.slack.adapter import _slash_user_id
+        from plugins.platforms.slack.adapter import _slash_context_key
 
-        adapter._slash_command_contexts[("C1", "U1")] = {
+        adapter._slash_command_contexts[("_legacy", "C1", "U1", "trigger-one")] = {
             "response_url": "https://hooks.slack.com/test",
             "ts": time.monotonic(),
         }
 
         # ContextVar is unset (default=None) — simulates a normal message send.
-        assert _slash_user_id.get() is None
+        assert _slash_context_key.get() is None
         ctx = adapter._pop_slash_context("C1")
-        # Fallback scan still finds it (channel-only) — this is fine for
-        # the normal single-user case; the ContextVar path is the precise one.
-        # The key invariant is: when the ContextVar IS set, it matches exactly.
-        assert ctx is not None  # fallback path finds the entry
+        assert ctx is None
+        assert len(adapter._slash_command_contexts) == 1
 
 
 # ---------------------------------------------------------------------------

@@ -844,6 +844,41 @@ async def test_handoff_to_telegram_dm_topic_uses_dm_lane_not_generic_thread(tmp_
 
 
 @pytest.mark.asyncio
+async def test_handoff_home_scope_propagates_to_source_and_final_send(tmp_path):
+    session_db = SessionDB(db_path=tmp_path / "state.db")
+    runner = _make_runner(session_db=session_db)
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="208214988",
+        name="Scoped Home",
+        scope_id="T_APOM",
+    )
+    adapter = runner.adapters[Platform.TELEGRAM]
+    adapter.create_handoff_thread = AsyncMock(return_value="17585")
+    adapter.send.return_value = SimpleNamespace(success=True)
+    captured = {}
+
+    async def fake_handle_message(event):
+        captured["source"] = event.source
+        return "handoff ok"
+
+    runner._handle_message = AsyncMock(side_effect=fake_handle_message)
+
+    await runner._process_handoff({
+        "id": "cli-session",
+        "title": "CLI work",
+        "handoff_platform": "telegram",
+    })
+
+    assert captured["source"].scope_id == "T_APOM"
+    adapter.send.assert_awaited_once_with(
+        chat_id="208214988",
+        content="handoff ok",
+        metadata={"thread_id": "17585", "scope_id": "T_APOM"},
+    )
+
+
+@pytest.mark.asyncio
 async def test_topic_root_command_creates_and_pins_system_topic(tmp_path, monkeypatch):
     import gateway.run as gateway_run
 

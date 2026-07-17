@@ -18,21 +18,38 @@ T5 반환 형식이 도구 반환 규약(JSON str: success/target/message_id 또
 import asyncio
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
-import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-# slack_agent 레포 루트(bridge 패키지 제공). 라이브 기본값 = 스미스 로컬 체크아웃.
+# slack_agent 레포 루트(bridge 패키지 제공). clean-env test wrapper가 사용자 env를
+# 지우므로, 현재 Session 2 worktree가 있으면 S1 계약을 포함한 쪽을 우선한다.
+_LIVE_SLACK_AGENT_ROOT = Path("/Users/charde023/workspace/slack_agent")
+_SESSION2_SLACK_AGENT_ROOT = (
+    _LIVE_SLACK_AGENT_ROOT / ".worktrees" / "slack-conversation-s2"
+)
+_DEFAULT_SLACK_AGENT_ROOT = (
+    _SESSION2_SLACK_AGENT_ROOT
+    if (_SESSION2_SLACK_AGENT_ROOT / "contracts" / "conversation-event.schema.json").is_file()
+    else _LIVE_SLACK_AGENT_ROOT
+)
 SLACK_AGENT_ROOT = os.environ.get(
-    "QUEUE_TEST_REPO_ROOT", "/Users/charde023/workspace/slack_agent"
+    "QUEUE_TEST_REPO_ROOT", str(_DEFAULT_SLACK_AGENT_ROOT)
 )
 _HAS_SLACK_AGENT = (
     Path(SLACK_AGENT_ROOT, "bridge", "local_repo.py").is_file()
     and Path(SLACK_AGENT_ROOT, "bridge", "agent_repo.py").is_file()
+)
+_HAS_CONVERSATION_V1 = (
+    _HAS_SLACK_AGENT
+    and Path(SLACK_AGENT_ROOT, "bridge", "conversation_http.py").is_file()
+    and Path(SLACK_AGENT_ROOT, "contracts", "conversation-event.schema.json").is_file()
 )
 
 if _HAS_SLACK_AGENT and SLACK_AGENT_ROOT not in sys.path:
@@ -49,16 +66,31 @@ class QueueHandoffToolTestBase(unittest.TestCase):
         tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(tmpdir.cleanup)
         self.db_path = str(Path(tmpdir.name) / "queue-test.sqlite3")
+        self.hermes_home = str(Path(tmpdir.name) / "hermes-home")
         self.env = {
             "QUEUE_DB_PATH": self.db_path,
             "QUEUE_AGENT": "chami",
             "QUEUE_REPO_ROOT": SLACK_AGENT_ROOT,
+            # Session 2부터 기본 로스터는 Agent Directory다. 이 legacy fixture는
+            # 외부 slack_agent checkout이 아직 S0/S1 계약을 포함하지 않는 CI에서도
+            # v1 회귀 테스트가 명시적 fallback으로 계속 돌게 한다.
+            "QUEUE_KNOWN_AGENTS": "chami,chadol,mei,anna,jeff",
+            "HERMES_HOME": self.hermes_home,
         }
         env_guard = patch.dict(os.environ, self.env, clear=False)
         env_guard.start()
         self.addCleanup(env_guard.stop)
         # 주변 셸/게이트웨이 세션 env가 새어 위양성을 내지 않게 정리.
-        for k in ("HERMES_SESSION_THREAD_ID", "HERMES_SESSION_CHAT_ID", "QUEUE_ENDPOINT", "QUEUE_TOKEN"):
+        for k in (
+            "HERMES_SESSION_THREAD_ID",
+            "HERMES_SESSION_CHAT_ID",
+            "HERMES_SESSION_KEY",
+            "HERMES_SESSION_MESSAGE_ID",
+            "QUEUE_ENDPOINT",
+            "QUEUE_TOKEN",
+            "QUEUE_PROTOCOL_VERSION",
+            "QUEUE_CONVERSATION_CREDENTIAL",
+        ):
             os.environ.pop(k, None)
 
     def make_repo(self):
@@ -129,6 +161,35 @@ class TestHandoffInsert(QueueHandoffToolTestBase):
         self.assertTrue(result.get("success"), result)
         self.assertNotEqual(result.get("thread_ts"), "C0B69KP8G2J")
         self.assertTrue(str(result.get("thread_ts")).startswith("qh-"), result)
+
+    def test_same_request_reuses_stable_idempotency_key_without_second_row(self):
+        self.make_repo()
+        args = {"to": "chadol", "message": "한 번만 처리", "thread": "topic-1"}
+
+        first = self.call_tool(**args)
+        second = self.call_tool(**args)
+
+        self.assertTrue(first.get("success"), first)
+        self.assertTrue(second.get("success"), second)
+        self.assertEqual(first["idempotency_key"], second["idempotency_key"])
+        self.assertTrue(first["idempotency_key"].startswith("queue_handoff:chami:"))
+        self.assertEqual(first["message_id"], second["message_id"])
+        self.assertFalse(first["duplicate"])
+        self.assertTrue(second["duplicate"])
+        self.assertEqual(len(self.inbox_rows()), 1)
+
+    def test_explicit_idempotency_key_collision_is_rejected_client_side(self):
+        self.make_repo()
+        first = self.call_tool(
+            to="chadol", message="원본", thread="topic-1", idempotency_key="job-42"
+        )
+        second = self.call_tool(
+            to="chadol", message="변조", thread="topic-1", idempotency_key="job-42"
+        )
+
+        self.assertTrue(first.get("success"), first)
+        self.assertIn("collision", second.get("error", ""))
+        self.assertEqual(len(self.inbox_rows()), 1)
 
 
 class TestCheckFn(QueueHandoffToolTestBase):
@@ -208,12 +269,35 @@ class TestDefenses(QueueHandoffToolTestBase):
         self.assertEqual(rows[0]["target"], "chadol")
 
     def test_known_agents_env_override(self):
-        # QUEUE_KNOWN_AGENTS로 로스터를 확장하면 그 키로 handoff 가능.
+        # Directory가 **없는 legacy checkout**에서만 QUEUE_KNOWN_AGENTS fallback.
+        empty_repo = tempfile.TemporaryDirectory()
+        self.addCleanup(empty_repo.cleanup)
         self.make_repo()
-        with patch.dict(os.environ, {"QUEUE_KNOWN_AGENTS": "kc,zed"}):
+        with patch.dict(
+            os.environ,
+            {
+                "QUEUE_REPO_ROOT": empty_repo.name,
+                "QUEUE_KNOWN_AGENTS": "kc,zed",
+            },
+            clear=False,
+        ), patch("tools.queue_handoff_tool._do_insert", return_value=True):
             result = self.call_tool(to="kc", message="확장 로스터")
         self.assertTrue(result.get("success"), result)
-        self.assertEqual(self.inbox_rows()[0]["target"], "kc")
+        self.assertEqual(result.get("target"), "kc")
+
+    def test_missing_directory_and_missing_legacy_roster_fails_closed(self):
+        empty_repo = tempfile.TemporaryDirectory()
+        self.addCleanup(empty_repo.cleanup)
+        self.make_repo()
+        with patch.dict(
+            os.environ,
+            {"QUEUE_REPO_ROOT": empty_repo.name},
+            clear=False,
+        ):
+            os.environ.pop("QUEUE_KNOWN_AGENTS", None)
+            result = self.call_tool(to="chadol", message="로스터 없음")
+        self.assertIn("Agent Directory", result.get("error", ""))
+        self.assertEqual(self.inbox_rows(), [])
 
     def test_missing_agent_identity_rejected(self):
         # QUEUE_AGENT 없으면 발신자 정체성이 없어 handoff 불가.
@@ -262,6 +346,463 @@ class TestRegistryRegistration(QueueHandoffToolTestBase):
         ):
             resolved = resolve_toolset("hermes-queue")
         self.assertIn("queue_handoff", resolved)
+
+
+class TestDynamicAgentDirectoryRoster(QueueHandoffToolTestBase):
+    """Agent Directory의 capability/peer ACL이 schema와 runtime의 같은 SSOT다."""
+
+    def _directory_root(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        path = root / "contracts" / "examples"
+        path.mkdir(parents=True)
+        shutil.copyfile(
+            Path(SLACK_AGENT_ROOT, "contracts", "agent-directory.schema.json"),
+            root / "contracts" / "agent-directory.schema.json",
+        )
+        validator_dir = root / "bridge"
+        validator_dir.mkdir()
+        shutil.copyfile(
+            Path(SLACK_AGENT_ROOT, "bridge", "conversation_contracts.py"),
+            validator_dir / "conversation_contracts.py",
+        )
+        directory = {
+            "contract_version": "1.0",
+            "workspaces": [
+                {
+                    "workspace_key": "team",
+                    "display_name": "테스트 팀",
+                    "slack_team_id": "T0TEAM",
+                    "slack_enterprise_id": None,
+                    "canonical_channel_ids": ["C0TEAM"],
+                    "enabled": True,
+                },
+                {
+                    "workspace_key": "apom",
+                    "display_name": "테스트 APOM",
+                    "slack_team_id": "T0APOM",
+                    "slack_enterprise_id": None,
+                    "canonical_channel_ids": ["C0APOM"],
+                    "enabled": False,
+                },
+            ],
+            "agents": [
+                {
+                    "agent_id": "chami",
+                    "display_name": "차미",
+                    "owner": "차드",
+                    "transport": "hybrid",
+                    "protocol_version": "conversation.v1",
+                    "capabilities": ["conversation", "queue_handoff"],
+                    "trust_tier": "internal",
+                    "allowed_peers": ["zed", "observer", "invited"],
+                    "slack_app": {
+                        "app_id": "A0CHAMI",
+                        "app_token_ref": "env://CHAMI_SLACK_APP_TOKEN",
+                        "leader_policy": "single_active_gateway",
+                        "installations": [
+                            {
+                                "installation_id": "chami:team",
+                                "workspace_key": "team",
+                                "bot_user_id": "U0CHAMI",
+                                "bot_id": "B0CHAMI",
+                                "bot_token_ref": "env://CHAMI_SLACK_BOT_TOKEN_TEAM",
+                                "granted_scopes": [],
+                                "enabled": True,
+                            },
+                            {
+                                "installation_id": "chami:apom",
+                                "workspace_key": "apom",
+                                "bot_user_id": None,
+                                "bot_id": None,
+                                "bot_token_ref": "env://CHAMI_SLACK_BOT_TOKEN_APOM",
+                                "granted_scopes": [],
+                                "enabled": False,
+                            },
+                        ],
+                    },
+                },
+                {
+                    "agent_id": "zed",
+                    "display_name": "제드",
+                    "owner": "테스트",
+                    "transport": "queue_native",
+                    "protocol_version": "conversation.v1",
+                    "capabilities": ["conversation", "queue_handoff"],
+                    "trust_tier": "trusted",
+                    "allowed_peers": ["chami"],
+                    "slack_app": None,
+                },
+                {
+                    "agent_id": "observer",
+                    "display_name": "관찰자",
+                    "owner": "테스트",
+                    "transport": "queue_native",
+                    "protocol_version": "conversation.v1",
+                    "capabilities": ["conversation"],
+                    "trust_tier": "observed",
+                    "allowed_peers": [],
+                    "slack_app": None,
+                },
+                {
+                    "agent_id": "invited",
+                    "display_name": "초대봇",
+                    "owner": "외부",
+                    "transport": "queue_native",
+                    "protocol_version": "conversation.v1",
+                    "capabilities": ["conversation", "queue_handoff"],
+                    "trust_tier": "invited",
+                    "allowed_peers": ["chami"],
+                    "slack_app": None,
+                },
+            ],
+        }
+        (path / "agent-directory.v1.json").write_text(
+            json.dumps(directory, ensure_ascii=False), encoding="utf-8"
+        )
+        return root
+
+    def test_directory_capability_and_allowed_peer_drive_runtime_roster(self):
+        root = self._directory_root()
+        with patch.dict(os.environ, {"QUEUE_REPO_ROOT": str(root)}, clear=False), patch(
+            "tools.queue_handoff_tool._do_insert", return_value=True
+        ):
+            accepted = self.call_tool(to="zed", message="새 봇에게 인계")
+            rejected = self.call_tool(to="observer", message="실행 권한 없는 봇")
+            invited = self.call_tool(to="invited", message="승격 전 실행 금지")
+            legacy_only = self.call_tool(to="chadol", message="Directory 밖")
+
+        self.assertTrue(accepted.get("success"), accepted)
+        self.assertIn("unknown agent", rejected.get("error", ""))
+        self.assertIn("unknown agent", invited.get("error", ""))
+        self.assertIn("unknown agent", legacy_only.get("error", ""))
+
+    def test_dynamic_tool_schema_names_only_current_directory_targets(self):
+        from tools.registry import registry
+
+        root = self._directory_root()
+        with patch.dict(os.environ, {"QUEUE_REPO_ROOT": str(root)}, clear=False):
+            definition = next(
+                row["function"]
+                for row in registry.get_definitions({"queue_handoff"})
+                if row["function"]["name"] == "queue_handoff"
+            )
+
+        self.assertIn("zed", definition["description"])
+        self.assertIn("제드", definition["parameters"]["properties"]["to"]["description"])
+        self.assertNotIn("chadol", definition["description"])
+        self.assertNotIn("QUEUE_CONVERSATION_CREDENTIAL", json.dumps(definition))
+
+    def test_invalid_existing_directory_does_not_fall_back_to_legacy_env(self):
+        root = self._directory_root()
+        directory_path = root / "contracts" / "examples" / "agent-directory.v1.json"
+        directory = json.loads(directory_path.read_text(encoding="utf-8"))
+        directory["agents"][0]["capabilities"] = "queue_handoff"
+        directory_path.write_text(json.dumps(directory), encoding="utf-8")
+
+        with patch.dict(
+            os.environ,
+            {
+                "QUEUE_REPO_ROOT": str(root),
+                "QUEUE_KNOWN_AGENTS": "chadol,zed",
+            },
+            clear=False,
+        ), patch("tools.queue_handoff_tool._do_insert", return_value=True) as insert:
+            result = self.call_tool(to="zed", message="깨진 Directory 우회 금지")
+
+        self.assertIn("Agent Directory", result.get("error", ""))
+        insert.assert_not_called()
+
+    def test_schema_forbidden_extra_field_does_not_open_roster(self):
+        root = self._directory_root()
+        directory_path = root / "contracts" / "examples" / "agent-directory.v1.json"
+        directory = json.loads(directory_path.read_text(encoding="utf-8"))
+        directory["unexpected_authorization"] = {"zed": True}
+        directory_path.write_text(json.dumps(directory), encoding="utf-8")
+
+        with patch.dict(
+            os.environ,
+            {
+                "QUEUE_REPO_ROOT": str(root),
+                "QUEUE_KNOWN_AGENTS": "zed",
+            },
+            clear=False,
+        ), patch("tools.queue_handoff_tool._do_insert", return_value=True) as insert:
+            result = self.call_tool(to="zed", message="extra field 우회 금지")
+
+        self.assertIn("Agent Directory", result.get("error", ""))
+        insert.assert_not_called()
+
+    def test_invalid_workspace_and_installation_do_not_open_roster(self):
+        mutations = {
+            "duplicate_workspace": lambda directory: directory["workspaces"][1].update(
+                {"workspace_key": "team"}
+            ),
+            "installation_id_mismatch": lambda directory: directory["agents"][0][
+                "slack_app"
+            ]["installations"][0].update({"installation_id": "chami:other"}),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                root = self._directory_root()
+                directory_path = (
+                    root / "contracts" / "examples" / "agent-directory.v1.json"
+                )
+                directory = json.loads(directory_path.read_text(encoding="utf-8"))
+                mutate(directory)
+                directory_path.write_text(json.dumps(directory), encoding="utf-8")
+
+                with patch.dict(
+                    os.environ,
+                    {
+                        "QUEUE_REPO_ROOT": str(root),
+                        "QUEUE_KNOWN_AGENTS": "zed",
+                    },
+                    clear=False,
+                ), patch(
+                    "tools.queue_handoff_tool._do_insert", return_value=True
+                ) as insert:
+                    result = self.call_tool(to="zed", message=f"{label} 우회 금지")
+
+                self.assertIn("Agent Directory", result.get("error", ""))
+                insert.assert_not_called()
+
+    def test_directory_schema_checksum_drift_does_not_open_roster(self):
+        root = self._directory_root()
+        schema_path = root / "contracts" / "agent-directory.schema.json"
+        schema_path.write_text(
+            schema_path.read_text(encoding="utf-8") + "\n", encoding="utf-8"
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "QUEUE_REPO_ROOT": str(root),
+                "QUEUE_KNOWN_AGENTS": "zed",
+            },
+            clear=False,
+        ), patch("tools.queue_handoff_tool._do_insert", return_value=True) as insert:
+            result = self.call_tool(to="zed", message="checksum drift 우회 금지")
+
+        self.assertIn("Agent Directory", result.get("error", ""))
+        insert.assert_not_called()
+
+
+class TestConversationV1Receipts(QueueHandoffToolTestBase):
+    """conversation.v1은 stable event 재조회로 accepted/completed receipt를 추적한다."""
+
+    def _v2_env(self):
+        return {
+            "QUEUE_PROTOCOL_VERSION": "conversation.v1",
+            "QUEUE_ENDPOINT": "http://127.0.0.1:8770",
+            "QUEUE_CONVERSATION_CREDENTIAL": "private-agent-credential",
+        }
+
+    def test_retry_reuses_byte_identical_event_and_observes_accepted(self):
+        seen = []
+
+        def append(*args, **kwargs):
+            seen.append(json.loads(json.dumps(kwargs["event"])))
+            return {
+                "receipt": "enqueued",
+                "event_id": kwargs["event"]["event_id"],
+                "delivery_status": "pending" if len(seen) == 1 else "accepted",
+                "inserted": len(seen) == 1,
+            }
+
+        with patch.dict(os.environ, self._v2_env(), clear=False), patch(
+            "tools.queue_handoff_tool._do_conversation_append", side_effect=append
+        ):
+            first = self.call_tool(
+                to="chadol", message="배포 확인", thread="incident-1"
+            )
+            second = self.call_tool(
+                to="chadol", message="배포 확인", thread="incident-1"
+            )
+
+        self.assertEqual(seen[0], seen[1])
+        self.assertEqual(first["idempotency_key"], second["idempotency_key"])
+        self.assertEqual(first["delivery_status"], "pending")
+        self.assertEqual(second["delivery_status"], "accepted")
+        self.assertTrue(second["accepted"])
+        self.assertFalse(second["completed"])
+        self.assertEqual(seen[0]["capability"], "queue_handoff")
+        self.assertEqual(seen[0]["sender_agent_id"], "chami")
+        self.assertEqual(seen[0]["target_agent_ids"], ["chadol"])
+        state_db = Path(self.hermes_home) / "state" / "queue_handoff_receipts.sqlite3"
+        self.assertNotIn(b"private-agent-credential", state_db.read_bytes())
+        self.assertNotIn(
+            "private-agent-credential",
+            json.dumps([first, second], ensure_ascii=False),
+        )
+
+    def test_receipt_action_loads_durable_event_and_observes_completed(self):
+        calls = []
+
+        def append(*args, **kwargs):
+            calls.append(kwargs["event"])
+            status = "pending" if len(calls) == 1 else "completed"
+            return {
+                "receipt": "enqueued",
+                "event_id": kwargs["event"]["event_id"],
+                "delivery_status": status,
+                "inserted": len(calls) == 1,
+            }
+
+        with patch.dict(os.environ, self._v2_env(), clear=False), patch(
+            "tools.queue_handoff_tool._do_conversation_append", side_effect=append
+        ):
+            sent = self.call_tool(
+                to="chadol", message="결과 추적", idempotency_key="deploy-2026-07-17"
+            )
+            receipt = self.call_tool(
+                action="receipt", idempotency_key="deploy-2026-07-17"
+            )
+
+        self.assertTrue(sent.get("success"), sent)
+        self.assertEqual(receipt["delivery_status"], "completed")
+        self.assertTrue(receipt["accepted"])
+        self.assertTrue(receipt["completed"])
+        self.assertEqual(calls[0], calls[1])
+
+    def test_v2_requires_endpoint_and_private_credential(self):
+        with patch.dict(
+            os.environ,
+            {"QUEUE_PROTOCOL_VERSION": "conversation.v1", "QUEUE_ENDPOINT": "http://x"},
+            clear=False,
+        ):
+            os.environ.pop("QUEUE_CONVERSATION_CREDENTIAL", None)
+            result = self.call_tool(to="chadol", message="설정 미완성")
+        self.assertIn("credential", result.get("error", "").lower())
+
+    def test_unknown_protocol_fails_closed_instead_of_falling_back_to_v1(self):
+        self.make_repo()
+        with patch.dict(os.environ, {"QUEUE_PROTOCOL_VERSION": "conversation.v9"}):
+            result = self.call_tool(to="chadol", message="미지원 프로토콜")
+        self.assertIn("unsupported", result.get("error", ""))
+        self.assertEqual(self.inbox_rows(), [])
+
+    def test_explicit_queue_v1_keeps_legacy_handoff(self):
+        self.make_repo()
+        with patch.dict(os.environ, {"QUEUE_PROTOCOL_VERSION": "queue.v1"}):
+            result = self.call_tool(to="chadol", message="명시적 v1")
+        self.assertTrue(result.get("success"), result)
+        self.assertEqual(result["protocol_version"], "queue.v1")
+        self.assertEqual(self.inbox_rows()[0]["text"], "명시적 v1")
+
+    def test_transport_error_redacts_conversation_credential(self):
+        with patch.dict(os.environ, self._v2_env(), clear=False), patch(
+            "tools.queue_handoff_tool._do_conversation_append",
+            side_effect=RuntimeError("private-agent-credential leaked upstream"),
+        ):
+            result = self.call_tool(to="chadol", message="오류 위생")
+        rendered = json.dumps(result, ensure_ascii=False)
+        self.assertNotIn("private-agent-credential", rendered)
+        self.assertIn("handoff", result.get("error", ""))
+
+    @unittest.skipUnless(
+        _HAS_CONVERSATION_V1,
+        f"slack_agent conversation.v1 contract not found: {SLACK_AGENT_ROOT}",
+    )
+    def test_real_s1_http_ledger_roundtrip_tracks_pending_accepted_completed(self):
+        """실 HTTP/client/ledger를 통과해 mock이 숨길 수 있는 contract drift를 잡는다."""
+        from bridge.conversation_auth import AuthenticationError, ConversationAuthorizer
+        from bridge.conversation_contracts import load_contract_bundle
+        from bridge.conversation_http import dispatch_conversation
+        from bridge.conversation_ledger import SQLiteConversationLedger
+        from bridge.queue_server import make_server
+        from bridge.repo import InMemoryQueueRepo
+
+        contracts = Path(SLACK_AGENT_ROOT) / "contracts"
+        bundle = load_contract_bundle(contracts)
+        ledger = SQLiteConversationLedger(
+            str(Path(self.hermes_home) / "s1-ledger.sqlite3"),
+            directory=bundle.directory,
+        )
+        authorizer = ConversationAuthorizer(bundle.directory)
+
+        def authenticate(provided):
+            if provided != "private-agent-credential":
+                raise AuthenticationError("invalid credential")
+            return "chami"
+
+        def dispatch_api(principal, method, params):
+            return dispatch_conversation(ledger, authorizer, principal, method, params)
+
+        server = make_server(
+            InMemoryQueueRepo(),
+            host="127.0.0.1",
+            port=0,
+            conversation_authenticate=authenticate,
+            conversation_dispatch=dispatch_api,
+        )
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        endpoint = f"http://127.0.0.1:{server.server_address[1]}"
+        env = self._v2_env() | {
+            "QUEUE_ENDPOINT": endpoint,
+            "QUEUE_REPO_ROOT": SLACK_AGENT_ROOT,
+        }
+        try:
+            with patch.dict(os.environ, env, clear=False):
+                sent = self.call_tool(
+                    to="chadol",
+                    message="실계약 왕복",
+                    thread="incident-real",
+                    idempotency_key="real-s1-roundtrip",
+                )
+                claim = ledger.claim_delivery("chadol", "worker", 60)
+                self.assertIsNotNone(claim)
+                ledger.advance_delivery(claim, "accepted")
+                accepted = self.call_tool(
+                    action="receipt", idempotency_key="real-s1-roundtrip"
+                )
+                ledger.advance_delivery(claim, "completed")
+                completed = self.call_tool(
+                    action="receipt", idempotency_key="real-s1-roundtrip"
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=5)
+
+        self.assertEqual(sent["delivery_status"], "pending")
+        self.assertEqual(accepted["delivery_status"], "accepted")
+        self.assertTrue(accepted["accepted"])
+        self.assertEqual(completed["delivery_status"], "completed")
+        self.assertTrue(completed["completed"])
+
+
+class TestReceiptStoreConcurrency(QueueHandoffToolTestBase):
+    def test_same_key_concurrent_reserve_selects_one_durable_event(self):
+        from tools.queue_handoff_receipts import QueueHandoffReceiptStore
+
+        path = Path(self.hermes_home) / "receipt-race.sqlite3"
+        barrier = threading.Barrier(2)
+
+        def reserve(marker):
+            store = QueueHandoffReceiptStore(path)
+            barrier.wait(timeout=5)
+            return store.reserve(
+                idempotency_key="queue_handoff:chami:" + "a" * 64,
+                request_hash="b" * 64,
+                protocol_version="conversation.v1",
+                event={"event_id": marker, "created_at": marker},
+                initial_status="pending",
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(reserve, ["first", "second"]))
+
+        records = [record for record, _created in results]
+        created = [_created for _record, _created in results]
+        self.assertEqual(sum(created), 1)
+        self.assertEqual(records[0].event, records[1].event)
+        with sqlite3.connect(path) as con:
+            self.assertEqual(
+                con.execute("SELECT COUNT(*) FROM queue_handoff_receipts").fetchone()[0],
+                1,
+            )
 
 
 class TestReturnContract(QueueHandoffToolTestBase):

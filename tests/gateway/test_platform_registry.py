@@ -949,6 +949,41 @@ class TestPluginEnablementGate:
         finally:
             _reg.unregister("myextrasplat")
 
+    def test_env_seeded_home_channel_preserves_scope_id(self, tmp_path, monkeypatch):
+        """Plugin home seeds keep the workspace discriminator intact."""
+        from gateway.platform_registry import platform_registry as _reg
+
+        _reg.register(PlatformEntry(
+            name="myscopedhome",
+            label="MyScopedHome",
+            adapter_factory=lambda cfg: None,
+            check_fn=lambda: True,
+            is_connected=lambda cfg: True,
+            env_enablement_fn=lambda: {
+                "home_channel": {
+                    "chat_id": "C_SHARED",
+                    "name": "APOM Ops",
+                    "thread_id": "171234.5678",
+                    "scope_id": "T_APOM",
+                },
+            },
+            source="plugin",
+        ))
+        try:
+            home = self._write_config(tmp_path)
+            monkeypatch.setenv("HERMES_HOME", str(home))
+
+            from gateway.config import load_gateway_config, Platform
+            cfg = load_gateway_config()
+
+            scoped_home = cfg.platforms[Platform("myscopedhome")].home_channel
+            assert scoped_home is not None
+            assert scoped_home.chat_id == "C_SHARED"
+            assert scoped_home.thread_id == "171234.5678"
+            assert scoped_home.scope_id == "T_APOM"
+        finally:
+            _reg.unregister("myscopedhome")
+
     def test_is_connected_failed_gate_does_not_leak_extras(
         self, tmp_path, monkeypatch
     ):

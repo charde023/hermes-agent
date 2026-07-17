@@ -1276,6 +1276,12 @@ def profile_env(tmp_path, monkeypatch):
 
 ---
 
+## MAP 인덱스
+
+| 영역 | MAP 경로 | 한 줄 요지 |
+|---|---|---|
+| Slack 멀티 워크스페이스·봇 대화 큐 | `CONVERSATION_TRANSPORT_MAP.md` | workspace scope 격리, `conversation.v1` claim/receipt, lease fencing, 동적 Agent Directory 항법도 |
+
 ## Testing
 
 **ALWAYS use `scripts/run_tests.sh`** — do not call `pytest` directly. The script enforces

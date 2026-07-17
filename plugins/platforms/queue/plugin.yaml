@@ -1,17 +1,13 @@
 name: queue-platform
 label: Queue
 kind: platform
-version: 1.0.0
+version: 1.1.0
 description: >
-  Local SQLite queue gateway adapter for Hermes Agent. Polls the slack_agent
-  bridge queue (slack_inbox) for claimed turns, relays them to the agent, and
-  writes replies back to slack_outbox for the bridge sender to deliver.
+  Queue gateway adapter for Hermes Agent. queue.v1 keeps the existing local or
+  HTTP inbox/outbox flow. conversation.v1 uses the canonical conversation
+  ledger, per-agent credentials, delivery receipts, and active-token fencing.
 author: charde023
 requires_env:
-  - name: QUEUE_DB_PATH
-    description: "Path to the slack_agent local SQLite queue database"
-    prompt: "Queue SQLite DB path"
-    password: false
   - name: QUEUE_AGENT
     description: "Claim target name in the queue (e.g. chami)"
     prompt: "Queue agent (claim target)"
@@ -21,6 +17,26 @@ requires_env:
     prompt: "slack_agent repo root"
     password: false
 optional_env:
+  - name: QUEUE_PROTOCOL_VERSION
+    description: "Queue protocol: queue.v1 (default) or conversation.v1"
+    prompt: "Queue protocol version"
+    password: false
+  - name: QUEUE_DB_PATH
+    description: "queue.v1 local SQLite path; required when QUEUE_ENDPOINT is absent"
+    prompt: "Queue SQLite DB path"
+    password: false
+  - name: QUEUE_ENDPOINT
+    description: "Queue HTTP endpoint; required for conversation.v1"
+    prompt: "Queue endpoint"
+    password: false
+  - name: QUEUE_TOKEN
+    description: "Legacy queue.v1 shared HTTP token"
+    prompt: "Legacy queue token"
+    password: true
+  - name: QUEUE_CONVERSATION_CREDENTIAL
+    description: "Dedicated per-agent credential required for conversation.v1"
+    prompt: "Conversation agent credential"
+    password: true
   - name: QUEUE_POLL_INTERVAL
     description: "Polling interval in seconds (default 2.0)"
     prompt: "Poll interval (seconds)"

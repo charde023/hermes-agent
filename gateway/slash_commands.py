@@ -950,6 +950,12 @@ class GatewaySlashCommandsMixin:
             }
             if event.source.thread_id:
                 notify_data["thread_id"] = event.source.thread_id
+            scope_id = (
+                getattr(event.source, "scope_id", None)
+                or getattr(event.source, "guild_id", None)
+            )
+            if scope_id:
+                notify_data["scope_id"] = str(scope_id)
             if event.message_id:
                 notify_data["message_id"] = event.message_id
             if event.source is not None:
@@ -2097,7 +2103,11 @@ class GatewaySlashCommandsMixin:
 
     async def _handle_set_home_command(self, event: MessageEvent) -> str:
         """Handle /sethome command -- set the current chat as the platform's home channel."""
-        from gateway.run import _home_target_env_var, _home_thread_env_var
+        from gateway.run import (
+            _home_scope_env_var,
+            _home_target_env_var,
+            _home_thread_env_var,
+        )
         source = event.source
         platform_name = source.platform.value if source.platform else "unknown"
         chat_id = source.chat_id
@@ -2105,7 +2115,12 @@ class GatewaySlashCommandsMixin:
 
         env_key = _home_target_env_var(platform_name)
         thread_env_key = _home_thread_env_var(platform_name)
+        scope_env_key = _home_scope_env_var(platform_name)
         thread_id = source.thread_id
+        scope_id = (
+            getattr(source, "scope_id", None)
+            or getattr(source, "guild_id", None)
+        )
 
         # Save to .env so it persists across restarts
         try:
@@ -2114,6 +2129,7 @@ class GatewaySlashCommandsMixin:
             # Keep thread/topic routing explicit and clear stale values when
             # /sethome is run from the parent chat instead of a thread.
             save_env_value(thread_env_key, str(thread_id or ""))
+            save_env_value(scope_env_key, str(scope_id or ""))
         except Exception as e:
             return t("gateway.set_home.save_failed", error=e)
 
@@ -2129,6 +2145,7 @@ class GatewaySlashCommandsMixin:
                 chat_id=str(chat_id),
                 name=chat_name,
                 thread_id=str(thread_id) if thread_id else None,
+                scope_id=str(scope_id) if scope_id else None,
             )
 
         return t("gateway.set_home.success", name=chat_name, chat_id=chat_id)
@@ -4102,6 +4119,12 @@ class GatewaySlashCommandsMixin:
         }
         if event.source.thread_id:
             pending["thread_id"] = event.source.thread_id
+        scope_id = (
+            getattr(event.source, "scope_id", None)
+            or getattr(event.source, "guild_id", None)
+        )
+        if scope_id:
+            pending["scope_id"] = str(scope_id)
         if event.message_id:
             pending["message_id"] = event.message_id
         _tmp_pending = pending_path.with_suffix(".tmp")

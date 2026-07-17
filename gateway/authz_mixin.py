@@ -278,6 +278,54 @@ class GatewayAuthorizationMixin:
         if not user_id:
             return False
 
+        # Slack installations are workspace-scoped credentials.  When the
+        # operator supplies a structured per-workspace allowlist, treat it as
+        # the authoritative boundary before any legacy process-wide
+        # ``SLACK_*``/``GATEWAY_*`` opt-in.  Otherwise the same user/channel ID
+        # in a second installation could inherit the primary workspace's
+        # authorization merely because both Socket Mode connections share one
+        # Hermes process.
+        if source.platform == Platform.SLACK:
+            gateway_config = getattr(self, "config", None)
+            platform_configs = getattr(gateway_config, "platforms", None)
+            slack_config = (
+                platform_configs.get(Platform.SLACK)
+                if isinstance(platform_configs, dict)
+                else None
+            )
+            slack_extra = getattr(slack_config, "extra", None)
+            workspace_allowlists = (
+                slack_extra.get("workspace_allowed_users")
+                if isinstance(slack_extra, dict)
+                else None
+            )
+            if workspace_allowlists is not None:
+                if not isinstance(workspace_allowlists, dict):
+                    return False
+                scope_id = str(
+                    getattr(source, "scope_id", None)
+                    or getattr(source, "guild_id", None)
+                    or ""
+                ).strip()
+                if not scope_id or scope_id not in workspace_allowlists:
+                    return False
+                raw_allowed = workspace_allowlists.get(scope_id)
+                if isinstance(raw_allowed, str):
+                    allowed_ids = {
+                        value.strip()
+                        for value in raw_allowed.split(",")
+                        if value.strip()
+                    }
+                elif isinstance(raw_allowed, (list, tuple, set)):
+                    allowed_ids = {
+                        str(value).strip()
+                        for value in raw_allowed
+                        if str(value).strip()
+                    }
+                else:
+                    return False
+                return "*" in allowed_ids or str(user_id) in allowed_ids
+
         platform_env_map = {
             Platform.TELEGRAM: "TELEGRAM_ALLOWED_USERS",
             Platform.DISCORD: "DISCORD_ALLOWED_USERS",

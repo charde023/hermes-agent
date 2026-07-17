@@ -787,6 +787,28 @@ def build_session_key(
     """
     ns = _session_key_namespace(profile)
     platform = source.platform.value
+
+    def with_workspace_scope(
+        key: str,
+        *,
+        has_chat_slot: bool,
+        has_thread_slot: bool,
+    ) -> str:
+        """Append Slack's workspace discriminator without shifting legacy fields.
+
+        Existing consumers parse ``platform/chat_type/chat_id`` from positions
+        2/3/4, so the workspace is an explicit suffix. Other platforms and
+        scope-less Slack sources retain byte-identical historical keys.
+        """
+        scope_id = getattr(source, "scope_id", None) or getattr(source, "guild_id", None)
+        if source.platform == Platform.SLACK and scope_id:
+            if not has_chat_slot:
+                key = f"{key}:"
+            if not has_thread_slot:
+                key = f"{key}:"
+            return f"{key}:scope:{scope_id}"
+        return key
+
     if source.chat_type == "dm":
         dm_chat_id = source.chat_id
         if source.platform == Platform.WHATSAPP:
@@ -794,8 +816,16 @@ def build_session_key(
 
         if dm_chat_id:
             if source.thread_id:
-                return f"{ns}:{platform}:dm:{dm_chat_id}:{source.thread_id}"
-            return f"{ns}:{platform}:dm:{dm_chat_id}"
+                return with_workspace_scope(
+                    f"{ns}:{platform}:dm:{dm_chat_id}:{source.thread_id}",
+                    has_chat_slot=True,
+                    has_thread_slot=True,
+                )
+            return with_workspace_scope(
+                f"{ns}:{platform}:dm:{dm_chat_id}",
+                has_chat_slot=True,
+                has_thread_slot=False,
+            )
         # No chat_id — fall back to the sender's own identifier before the
         # bare per-platform sink.  Without this, every DM from every user that
         # arrives without a chat_id (non-standard adapters / synthetic sources)
@@ -810,11 +840,27 @@ def build_session_key(
             )
         if dm_participant_id:
             if source.thread_id:
-                return f"{ns}:{platform}:dm:{dm_participant_id}:{source.thread_id}"
-            return f"{ns}:{platform}:dm:{dm_participant_id}"
+                return with_workspace_scope(
+                    f"{ns}:{platform}:dm:{dm_participant_id}:{source.thread_id}",
+                    has_chat_slot=True,
+                    has_thread_slot=True,
+                )
+            return with_workspace_scope(
+                f"{ns}:{platform}:dm:{dm_participant_id}",
+                has_chat_slot=True,
+                has_thread_slot=False,
+            )
         if source.thread_id:
-            return f"{ns}:{platform}:dm:{source.thread_id}"
-        return f"{ns}:{platform}:dm"
+            return with_workspace_scope(
+                f"{ns}:{platform}:dm:{source.thread_id}",
+                has_chat_slot=True,
+                has_thread_slot=False,
+            )
+        return with_workspace_scope(
+            f"{ns}:{platform}:dm",
+            has_chat_slot=False,
+            has_thread_slot=False,
+        )
 
     participant_id = source.user_id_alt or source.user_id
     if participant_id and source.platform == Platform.WHATSAPP:
@@ -823,10 +869,23 @@ def build_session_key(
         # bridge reshuffles alias forms.
         participant_id = canonical_whatsapp_identifier(str(participant_id)) or participant_id
     key_parts = [ns, platform, source.chat_type]
+    slack_scope_id = (
+        getattr(source, "scope_id", None) or getattr(source, "guild_id", None)
+        if source.platform == Platform.SLACK
+        else None
+    )
 
     if source.chat_id:
         key_parts.append(source.chat_id)
-    if source.thread_id:
+    if slack_scope_id:
+        # Keep chat_id at parts[4] and reserve parts[5] for the thread even
+        # when absent. This prevents legacy parsers from reading the literal
+        # ``scope`` marker as a DM/thread id.
+        if not source.chat_id:
+            key_parts.append("")
+        key_parts.append(source.thread_id or "")
+        key_parts.extend(["scope", str(slack_scope_id)])
+    elif source.thread_id:
         key_parts.append(source.thread_id)
 
     # In threads, default to shared sessions (all participants see the same

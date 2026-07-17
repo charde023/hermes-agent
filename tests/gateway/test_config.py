@@ -18,13 +18,22 @@ from gateway.config import (
 
 class TestHomeChannelRoundtrip:
     def test_to_dict_from_dict(self):
-        hc = HomeChannel(platform=Platform.DISCORD, chat_id="999", name="general")
+        hc = HomeChannel(
+            platform=Platform.SLACK,
+            chat_id="C_SHARED",
+            name="apom-ops",
+            thread_id="171234.5678",
+            scope_id="T_APOM",
+        )
         d = hc.to_dict()
         restored = HomeChannel.from_dict(d)
 
-        assert restored.platform == Platform.DISCORD
-        assert restored.chat_id == "999"
-        assert restored.name == "general"
+        assert d["scope_id"] == "T_APOM"
+        assert restored.platform == Platform.SLACK
+        assert restored.chat_id == "C_SHARED"
+        assert restored.name == "apom-ops"
+        assert restored.thread_id == "171234.5678"
+        assert restored.scope_id == "T_APOM"
 
 
 class TestPlatformConfigRoundtrip:
@@ -622,6 +631,35 @@ class TestLoadGatewayConfig:
         )
         assert telegram.extra["reply_prefix"] == "nested"
 
+    def test_platforms_slack_home_channel_loads_durable_scope_id(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "platforms:\n"
+            "  slack:\n"
+            "    enabled: false\n"
+            "    home_channel:\n"
+            "      platform: slack\n"
+            "      chat_id: C_SHARED\n"
+            "      name: APOM Ops\n"
+            "      thread_id: '171234.5678'\n"
+            "      scope_id: T_APOM\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.SLACK].home_channel == HomeChannel(
+            platform=Platform.SLACK,
+            chat_id="C_SHARED",
+            name="APOM Ops",
+            thread_id="171234.5678",
+            scope_id="T_APOM",
+        )
+
     def test_top_level_platforms_override_nested_gateway_platforms(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
@@ -1140,3 +1178,27 @@ class TestHomeChannelEnvOverrides:
             home = config.platforms[platform].home_channel
             assert home is not None, f"{platform.value}: home_channel should not be None"
             assert (home.chat_id, home.name) == expected, platform.value
+            # Legacy home env vars remain a single-workspace fallback. Scope
+            # is only accepted from the durable config.yaml home_channel.
+            assert home.scope_id is None, platform.value
+
+    def test_slack_home_env_accepts_workspace_scope(self):
+        config = GatewayConfig(
+            platforms={
+                Platform.SLACK: PlatformConfig(enabled=True, token="xoxb-from-config")
+            }
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "SLACK_HOME_CHANNEL": "C_APOM",
+                "SLACK_HOME_CHANNEL_SCOPE_ID": "T_APOM",
+            },
+            clear=True,
+        ):
+            _apply_env_overrides(config)
+
+        home = config.platforms[Platform.SLACK].home_channel
+        assert home is not None
+        assert home.chat_id == "C_APOM"
+        assert home.scope_id == "T_APOM"

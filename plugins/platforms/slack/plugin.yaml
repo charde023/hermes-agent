@@ -7,20 +7,37 @@ description: >
   Connects to Slack via slack-bolt in Socket Mode and relays messages
   between Slack channels/DMs and the Hermes agent. Supports slash
   commands, threads, mrkdwn rendering, approval blocks, free-response
-  channels, mention gating, and channel skill bindings.
+  channels, mention gating, channel skill bindings, and team-scoped
+  multi-workspace authorization. Configure `slack.multi_workspace` and
+  `slack.workspace_home_channels` in config.yaml for more than one workspace.
+  Bot credentials stay in the environment: map each team ID to an
+  `env://UPPERCASE_SECRET_REF` with `slack.workspace_bot_token_refs`; plain
+  token values and comma-separated bot tokens are rejected. Workspace-scoped
+  authorization can use `slack.workspace_allowed_users`. Publish a
+  profile-local monitoring receipt by mapping every installed team ID to one
+  stable lowercase key with `slack.workspace_keys` (for example,
+  `T_TEAM: team` and `T_APOM: apom`). The receipt agent key resolves from
+  `slack.workspace_status_agent_key`, `QUEUE_AGENT`, gateway/profile env, then
+  the active profile; no Slack token, URL, or member ID is published. In
+  multi-workspace mode, `slack.channel_prompts` must use the scoped schema
+  `{TEAM_ID: {CHANNEL_ID: PROMPT}}`, and every
+  `slack.channel_skill_bindings` entry must include its `team_id` alongside
+  `id` and `skill`/`skills`. Legacy unscoped channel prompts and bindings are
+  accepted only for a single workspace and are ignored when workspace scope
+  is required.
 author: NousResearch
 requires_env:
-  - name: SLACK_BOT_TOKEN
-    description: "Slack bot token (xoxb-...)"
-    prompt: "Slack Bot Token (xoxb-...)"
-    url: "https://api.slack.com/apps"
-    password: true
   - name: SLACK_APP_TOKEN
     description: "Slack app-level token for Socket Mode (xapp-..., scope connections:write)"
     prompt: "Slack App Token (xapp-...)"
     url: "https://api.slack.com/apps"
     password: true
 optional_env:
+  - name: SLACK_BOT_TOKEN
+    description: "Legacy single-workspace Slack bot token (xoxb-...); multi-workspace installs use config.yaml env:// secret refs"
+    prompt: "Slack Bot Token (xoxb-...)"
+    url: "https://api.slack.com/apps"
+    password: true
   - name: SLACK_ALLOWED_USERS
     description: "Comma-separated Slack member IDs allowed to talk to the bot"
     prompt: "Allowed users (comma-separated)"

@@ -1,4 +1,4 @@
-"""Queue platform adapter — slack_agent 로컬 SQLite 큐 <-> Hermes 게이트웨이 브리지.
+"""Queue platform adapter — slack_agent queue <-> Hermes 게이트웨이 브리지.
 
 slack_agent 레포(bridge.local_repo.SQLiteQueueRepo)의 slack_inbox를 폴링해
 세션 턴을 claim 하고, 코어(handle_message)로 넘긴 뒤 결과를 slack_outbox에
@@ -13,19 +13,25 @@ INSERT 한다(실제 슬랙 발신은 slack_bridge.py 센더가 담당).
   reclaim(reclaim_stale_claimed)이 CLAIM_TTL 경과 후 pending으로 복구한다.
   따라서 재시작 시 유실 대신 재처리(드물게 중복 응답 가능)가 일어난다.
 
-필수 env: QUEUE_AGENT / QUEUE_REPO_ROOT, 그리고 QUEUE_DB_PATH 또는 QUEUE_ENDPOINT
-옵션 env: QUEUE_TOKEN, QUEUE_POLL_INTERVAL(기본 2.0초, 최소 0.2초),
-         QUEUE_ALLOWED_SENDERS(콤마 구분), QUEUE_ALLOW_ALL_USERS
+기본 ``queue.v1``은 QUEUE_AGENT / QUEUE_REPO_ROOT와 QUEUE_DB_PATH 또는
+QUEUE_ENDPOINT를 사용한다. ``QUEUE_PROTOCOL_VERSION=conversation.v1``은
+QUEUE_ENDPOINT와 별도 per-agent QUEUE_CONVERSATION_CREDENTIAL을 필수로 사용한다.
+두 프로토콜은 같은 어댑터 안에서 선택되지만 저장·인증 계약은 섞지 않는다.
 """
 
 import asyncio
+import contextvars
+import json
 import logging
 import os
 import re
 import sys
 import time
 import uuid
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Mapping, Optional
 
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -45,6 +51,9 @@ RECLAIM_INTERVAL_SECONDS = 60
 # 0/음수 폴링 간격은 공유 라이브 SQLite(slack_bridge와 공유) 상대 busy-loop이
 # 되므로 하한을 강제한다.
 MIN_POLL_INTERVAL_SECONDS = 0.2
+_LEGACY_PROTOCOL = "queue.v1"
+_CONVERSATION_PROTOCOL = "conversation.v1"
+_SUPPORTED_PROTOCOLS = {_LEGACY_PROTOCOL, _CONVERSATION_PROTOCOL}
 
 # send() 라우팅 접두 규약.
 #   "queue:<slack채널>"  → 자동 응답(코어가 인바운드 턴에 답) → slack_outbox.
@@ -65,6 +74,33 @@ _HANDOFF_EVENT_PREFIX = "qho-"
 # handoff target으로 잘못 넘어온 경우를 식별한다. 에이전트 키는 소문자라
 # (chami/chadol/mei/anna/jeff) 이 대문자 접두 패턴에 매치되지 않는다.
 _SLACK_CHANNEL_ID_RE = re.compile(r"^[CGD][A-Z0-9]{7,}$")
+
+# BasePlatformAdapter.handle_message()는 실제 처리 태스크를 spawn한 뒤 즉시
+# 돌아온다. ContextVar는 그 spawn 시점에 claim 식별자를 자식 태스크로 복사해
+# 주므로, 최종 send()가 원래 DB 턴 소유권을 다시 확인할 수 있다.
+_ACTIVE_QUEUE_EVENT_ID: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "queue_active_event_id",
+    default=None,
+)
+# conversation.v1은 event ID만으로 소유권을 증명하지 않는다. claim 때 발급된
+# active_delivery_token을 처리 task context까지 같이 운반해 stale worker가
+# no-reply send 경계를 통과하지 못하게 한다.
+_ACTIVE_QUEUE_DELIVERY_TOKEN: contextvars.ContextVar[Optional[str]] = (
+    contextvars.ContextVar("queue_active_delivery_token", default=None)
+)
+
+
+@dataclass(frozen=True)
+class _ConversationTurn:
+    """검증을 통과해 ``accepted``로 전이된 canonical delivery claim."""
+
+    event: Mapping[str, Any]
+    event_id: str
+    conversation_id: str
+    target_agent_id: str
+    worker: str
+    active_delivery_token: str
+    lease_expires_at: datetime
 
 
 def _normalize_reply_channel(channel: str) -> str:
@@ -205,6 +241,16 @@ class QueueAdapter(BasePlatformAdapter):
         self._token = (os.getenv("QUEUE_TOKEN", "") or str(extra.get("token", ""))).strip()
         self._agent = (os.getenv("QUEUE_AGENT", "") or str(extra.get("agent", ""))).strip()
         self._repo_root = (os.getenv("QUEUE_REPO_ROOT", "") or str(extra.get("repo_root", ""))).strip()
+        self._protocol_version = (
+            os.getenv("QUEUE_PROTOCOL_VERSION", "")
+            or str(extra.get("protocol_version", ""))
+            or _LEGACY_PROTOCOL
+        ).strip()
+        # credential 값은 config.yaml extra로 받지 않는다. 프로필 private env에만
+        # 두어 config dump/plugin receipt/log로 새는 표면을 줄인다.
+        self._conversation_credential = os.getenv(
+            "QUEUE_CONVERSATION_CREDENTIAL", ""
+        ).strip()
         self._poll_interval = max(
             MIN_POLL_INTERVAL_SECONDS, _float_env("QUEUE_POLL_INTERVAL", 2.0)
         )
@@ -212,14 +258,17 @@ class QueueAdapter(BasePlatformAdapter):
         # locked_by=worker 가드가 상대 프로세스의 락을 풀지 않게.
         self._worker = f"queue-adapter-{self._agent}-{os.getpid()}"
         self._repo = None
+        self._conversation_client = None
+        self._conversation_directory: Optional[Mapping[str, Any]] = None
         self._poll_task: Optional[asyncio.Task] = None
-        # 코어로 인계된 in-flight 턴: event.message_id(slack_event_ts) -> SessionTurn.
-        # on_processing_complete에서 pop해 done/error 마킹 + 세션 락 해제.
+        # 코어로 인계된 in-flight 턴: v1 SessionTurn 또는 v2 _ConversationTurn.
+        # on_processing_complete에서 protocol별 상태 전이를 마감한다.
         self._inflight: Dict[str, Any] = {}
         self._last_reclaim = 0.0
 
         logger.info(
-            "[Queue] Adapter initialized (db=%s, endpoint=%s, agent=%s)",
+            "[Queue] Adapter initialized (protocol=%s, db=%s, endpoint=%s, agent=%s)",
+            self._protocol_version,
             self._db_path,
             self._endpoint,
             self._agent,
@@ -227,11 +276,29 @@ class QueueAdapter(BasePlatformAdapter):
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """필수 설정 검증 후 bridge repo를 열고 폴링 태스크를 시작한다."""
+        if self._protocol_version not in _SUPPORTED_PROTOCOLS:
+            message = f"Unsupported QUEUE_PROTOCOL_VERSION: {self._protocol_version}"
+            logger.error("[Queue] %s", message)
+            self._set_fatal_error(
+                "queue_unsupported_protocol", message, retryable=False
+            )
+            return False
+
         required = [
             ("QUEUE_AGENT", self._agent),
             ("QUEUE_REPO_ROOT", self._repo_root),
         ]
-        if not self._endpoint:
+        if self._protocol_version == _CONVERSATION_PROTOCOL:
+            required.extend(
+                [
+                    ("QUEUE_ENDPOINT", self._endpoint),
+                    (
+                        "QUEUE_CONVERSATION_CREDENTIAL",
+                        self._conversation_credential,
+                    ),
+                ]
+            )
+        elif not self._endpoint:
             required.insert(0, ("QUEUE_DB_PATH", self._db_path))
         missing = [name for name, value in required if not value]
         if missing:
@@ -254,22 +321,51 @@ class QueueAdapter(BasePlatformAdapter):
         if self._repo_root not in sys.path:
             sys.path.append(self._repo_root)
         try:
-            def _load_repo():
-                from bridge.agent_repo import make_agent_queue_repo
+            if self._protocol_version == _CONVERSATION_PROTOCOL:
+                def _load_conversation():
+                    from bridge.conversation_contracts import (
+                        validate_directory,
+                        validate_directory_schema,
+                    )
+                    from bridge.conversation_http import HttpConversationClient
 
-                return make_agent_queue_repo(
-                    db_path=self._db_path,
-                    endpoint=self._endpoint,
-                    token=self._token,
-                )
+                    contracts_dir = Path(self._repo_root) / "contracts"
+                    directory_path = (
+                        contracts_dir / "examples" / "agent-directory.v1.json"
+                    )
+                    directory = json.loads(directory_path.read_text(encoding="utf-8"))
+                    if not isinstance(directory, dict):
+                        raise ValueError("Agent Directory root must be an object")
+                    validate_directory_schema(directory, contracts_dir)
+                    validate_directory(directory)
+                    client = HttpConversationClient(
+                        endpoint=self._endpoint,
+                        credential=self._conversation_credential,
+                    )
+                    return client, directory
 
-            # 생성자가 sqlite connect + DDL(blocking, busy 시 최대 30초)을
-            # 수행하므로 이벤트루프 밖(스레드)에서 만든다.
-            self._repo = await asyncio.to_thread(_load_repo)
+                (
+                    self._conversation_client,
+                    self._conversation_directory,
+                ) = await asyncio.to_thread(_load_conversation)
+            else:
+                def _load_repo():
+                    from bridge.agent_repo import make_agent_queue_repo
+
+                    return make_agent_queue_repo(
+                        db_path=self._db_path,
+                        endpoint=self._endpoint,
+                        token=self._token,
+                    )
+
+                # 생성자가 sqlite connect + DDL(blocking, busy 시 최대 30초)을
+                # 수행하므로 이벤트루프 밖(스레드)에서 만든다.
+                self._repo = await asyncio.to_thread(_load_repo)
         except Exception as e:
             message = (
-                f"Failed to load slack_agent bridge repo "
-                f"(QUEUE_REPO_ROOT={self._repo_root}, QUEUE_DB_PATH={self._db_path}, "
+                f"Failed to load slack_agent queue protocol "
+                f"(protocol={self._protocol_version}, "
+                f"QUEUE_REPO_ROOT={self._repo_root}, QUEUE_DB_PATH={self._db_path}, "
                 f"QUEUE_ENDPOINT={self._endpoint}): {e}"
             )
             logger.error("[Queue] %s", message, exc_info=True)
@@ -279,8 +375,11 @@ class QueueAdapter(BasePlatformAdapter):
         self._mark_connected()
         self._poll_task = asyncio.create_task(self._poll_loop())
         logger.info(
-            "[Queue] Connected — polling %s as target '%s' (interval %.2fs)",
-            self._endpoint or self._db_path, self._agent, self._poll_interval,
+            "[Queue] Connected — polling %s as target '%s' via %s (interval %.2fs)",
+            self._endpoint or self._db_path,
+            self._agent,
+            self._protocol_version,
+            self._poll_interval,
         )
         return True
 
@@ -306,6 +405,10 @@ class QueueAdapter(BasePlatformAdapter):
         재수거한다. 기준은 세션 락 TTL과 동일(CLAIM_TTL_SECONDS) — 락이
         만료된 row만 되돌아오므로 정상 처리 중인 턴은 건드리지 않는다.
         """
+        if self._protocol_version == _CONVERSATION_PROTOCOL:
+            # v2 claim_delivery가 pending뿐 아니라 lease-expired
+            # claimed/accepted까지 원자적으로 재claim한다.
+            return
         now = time.monotonic()
         if self._last_reclaim and now - self._last_reclaim < RECLAIM_INTERVAL_SECONDS:
             return
@@ -327,6 +430,9 @@ class QueueAdapter(BasePlatformAdapter):
         SQLiteQueueRepo는 동기 blocking이므로 모든 repo 호출은 asyncio.to_thread
         로 스레드에 내린다(이벤트루프 블로킹 금지).
         """
+        if self._protocol_version == _CONVERSATION_PROTOCOL:
+            return await self._poll_conversation_once()
+
         turn = await asyncio.to_thread(
             self._repo.claim_session_turn,
             target=self._agent,
@@ -356,6 +462,257 @@ class QueueAdapter(BasePlatformAdapter):
                         turn.session_id,
                     )
         return True
+
+    async def _conversation_call(
+        self, method: str, params: Mapping[str, Any]
+    ) -> Optional[Mapping[str, Any]]:
+        """동기 HttpConversationClient를 이벤트루프 밖에서 호출한다."""
+        if self._conversation_client is None:
+            raise RuntimeError("conversation client not connected")
+        result = await asyncio.to_thread(
+            self._conversation_client.call, method, dict(params)
+        )
+        if result is not None and not isinstance(result, Mapping):
+            raise RuntimeError("conversation API returned a non-object result")
+        return result
+
+    async def _poll_conversation_once(self) -> bool:
+        """canonical delivery 하나를 claim하고 accepted 뒤 코어로 인계한다."""
+        claim = await self._conversation_call(
+            "claim_delivery",
+            {
+                "target_agent_id": self._agent,
+                "worker": self._worker,
+                "ttl_seconds": CLAIM_TTL_SECONDS,
+            },
+        )
+        if claim is None:
+            return False
+
+        try:
+            turn = await self._validate_conversation_claim(claim)
+        except Exception as exc:
+            logger.error("[Queue] Invalid conversation claim payload: %s", exc)
+            await self._error_owned_conversation_claim(claim)
+            return True
+
+        try:
+            await self._advance_conversation_delivery(
+                turn,
+                expected_state="claimed",
+                next_state="accepted",
+            )
+        except Exception as exc:
+            # server가 token/lease를 최종 판정한다. accepted 실패 claim을 코어에
+            # 넘기지 않고, 새 owner/reclaim 경로가 이어받게 둔다.
+            logger.warning(
+                "[Queue] Conversation claim acceptance fenced (event=%s): %s",
+                turn.event_id,
+                exc,
+            )
+            return True
+
+        try:
+            await self._dispatch_conversation_turn(turn)
+        except BaseException as exc:
+            logger.error(
+                "[Queue] Conversation turn dispatch failed (event=%s): %s",
+                turn.event_id,
+                exc,
+                exc_info=True,
+            )
+            try:
+                await self._advance_conversation_delivery(
+                    turn,
+                    expected_state="accepted",
+                    next_state="error",
+                )
+            except Exception:
+                logger.warning(
+                    "[Queue] Conversation error transition fenced (event=%s)",
+                    turn.event_id,
+                    exc_info=True,
+                )
+        return True
+
+    async def _validate_conversation_claim(
+        self, claim: Mapping[str, Any]
+    ) -> _ConversationTurn:
+        """claim envelope와 canonical event를 독립 재검증한다."""
+        if not isinstance(claim, Mapping):
+            raise ValueError("claim must be an object")
+        event = claim.get("event")
+        if not isinstance(event, Mapping):
+            raise ValueError("claim event payload is required")
+
+        event_id = str(claim.get("event_id") or "").strip()
+        conversation_id = str(claim.get("conversation_id") or "").strip()
+        target_agent_id = str(claim.get("target_agent_id") or "").strip()
+        worker = str(claim.get("worker") or "").strip()
+        active_token = str(claim.get("active_delivery_token") or "").strip()
+        lease_raw = claim.get("lease_expires_at")
+        if not all(
+            (event_id, conversation_id, target_agent_id, worker, active_token, lease_raw)
+        ):
+            raise ValueError("claim identity fields are required")
+        if target_agent_id != self._agent:
+            raise ValueError("claim target does not match adapter agent")
+        if worker != self._worker:
+            raise ValueError("claim worker does not match adapter worker")
+        try:
+            lease_expires_at = datetime.fromisoformat(
+                str(lease_raw).replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("claim lease_expires_at is invalid") from exc
+        if lease_expires_at.tzinfo is None or lease_expires_at.utcoffset() is None:
+            raise ValueError("claim lease_expires_at must be timezone-aware")
+        lease_expires_at = lease_expires_at.astimezone(timezone.utc)
+
+        canonical_event = json.loads(
+            json.dumps(dict(event), ensure_ascii=False, sort_keys=True)
+        )
+        if canonical_event.get("event_id") != event_id:
+            raise ValueError("claim/event event_id mismatch")
+        if canonical_event.get("conversation_id") != conversation_id:
+            raise ValueError("claim/event conversation_id mismatch")
+        if canonical_event.get("protocol_version") != _CONVERSATION_PROTOCOL:
+            raise ValueError("claim event protocol mismatch")
+        targets = canonical_event.get("target_agent_ids")
+        if not isinstance(targets, list) or self._agent not in targets:
+            raise ValueError("adapter agent is not an event target")
+        if self._conversation_directory is None:
+            raise ValueError("Agent Directory is not loaded")
+
+        def _validate():
+            from bridge.conversation_contracts import (
+                validate_event,
+                validate_event_schema,
+            )
+
+            contracts_dir = Path(self._repo_root) / "contracts"
+            validate_event_schema(canonical_event, contracts_dir)
+            validate_event(canonical_event, self._conversation_directory)
+
+        await asyncio.to_thread(_validate)
+        return _ConversationTurn(
+            event=canonical_event,
+            event_id=event_id,
+            conversation_id=conversation_id,
+            target_agent_id=target_agent_id,
+            worker=worker,
+            active_delivery_token=active_token,
+            lease_expires_at=lease_expires_at,
+        )
+
+    async def _error_owned_conversation_claim(
+        self, claim: Mapping[str, Any]
+    ) -> None:
+        """invalid payload도 server가 token 소유권을 확인할 때만 error로 전이."""
+        if not isinstance(claim, Mapping):
+            return
+        event_id = str(claim.get("event_id") or "").strip()
+        target = str(claim.get("target_agent_id") or "").strip()
+        worker = str(claim.get("worker") or "").strip()
+        token = str(claim.get("active_delivery_token") or "").strip()
+        if (
+            not event_id
+            or target != self._agent
+            or worker != self._worker
+            or not token
+        ):
+            return
+        try:
+            await self._conversation_call(
+                "advance_delivery",
+                {
+                    "event_id": event_id,
+                    "target_agent_id": self._agent,
+                    "expected_state": "claimed",
+                    "next_state": "error",
+                    "active_token": token,
+                },
+            )
+        except Exception:
+            logger.warning(
+                "[Queue] Invalid claim error transition fenced (event=%s)",
+                event_id,
+                exc_info=True,
+            )
+
+    async def _advance_conversation_delivery(
+        self,
+        turn: _ConversationTurn,
+        *,
+        expected_state: str,
+        next_state: str,
+    ) -> Mapping[str, Any]:
+        result = await self._conversation_call(
+            "advance_delivery",
+            {
+                "event_id": turn.event_id,
+                "target_agent_id": turn.target_agent_id,
+                "expected_state": expected_state,
+                "next_state": next_state,
+                "active_token": turn.active_delivery_token,
+            },
+        )
+        if not isinstance(result, Mapping) or result.get("updated") is not True:
+            raise RuntimeError("conversation delivery transition was not acknowledged")
+        return result
+
+    async def _dispatch_conversation_turn(self, turn: _ConversationTurn) -> None:
+        """canonical event를 internal/no-reply MessageEvent로 변환한다.
+
+        v2 handoff는 one-way다. 일반 모델 응답은 외부 Slack/outbox로 보내지 않고,
+        결과 회신이 필요하면 모델이 ``queue_handoff``를 역방향으로 명시 호출한다.
+        """
+        event_payload = turn.event
+        sender = str(event_payload["sender_agent_id"])
+        source = self.build_source(
+            chat_id=_NO_REPLY_CHANNEL,
+            chat_name=f"queue:{turn.conversation_id}",
+            chat_type="channel",
+            user_id=sender,
+            user_name=sender,
+            thread_id=turn.conversation_id,
+        )
+        event = MessageEvent(
+            text=str(event_payload["body"]),
+            source=source,
+            raw_message=dict(event_payload),
+            message_id=turn.event_id,
+            internal=True,
+            metadata={
+                "protocol_version": _CONVERSATION_PROTOCOL,
+                "conversation_id": turn.conversation_id,
+                "correlation_id": event_payload.get("correlation_id"),
+                "causation_id": event_payload.get("causation_id"),
+                "event_type": event_payload.get("event_type"),
+                "capability": event_payload.get("capability"),
+                "trust_tier": event_payload.get("trust_tier"),
+                "active_delivery_token": turn.active_delivery_token,
+            },
+        )
+        logger.info(
+            "[Queue] New conversation turn from %s (event=%s, conversation=%s)",
+            sender,
+            turn.event_id,
+            turn.conversation_id,
+        )
+        self._inflight[turn.event_id] = turn
+        event_token = _ACTIVE_QUEUE_EVENT_ID.set(turn.event_id)
+        delivery_token = _ACTIVE_QUEUE_DELIVERY_TOKEN.set(
+            turn.active_delivery_token
+        )
+        try:
+            await self.handle_message(event)
+        except BaseException:
+            self._inflight.pop(turn.event_id, None)
+            raise
+        finally:
+            _ACTIVE_QUEUE_DELIVERY_TOKEN.reset(delivery_token)
+            _ACTIVE_QUEUE_EVENT_ID.reset(event_token)
 
     async def _process_turn(self, turn) -> bool:
         """claim된 턴 하나를 코어로 인계한다. 인계 성공 시 True.
@@ -445,13 +802,99 @@ class QueueAdapter(BasePlatformAdapter):
             turn.slack_user_id, turn.channel_id, turn.inbox_id,
         )
         self._inflight[event.message_id] = turn
+        context_token = _ACTIVE_QUEUE_EVENT_ID.set(event.message_id)
         try:
             await self.handle_message(event)
         except BaseException:
             # 동기 실패(스폰 전) — in-flight 등록을 되돌리고 상위에서 error 마킹.
             self._inflight.pop(event.message_id, None)
             raise
+        finally:
+            # handle_message가 만든 백그라운드 태스크는 위 ContextVar 값을 이미
+            # 상속했다. 폴링 태스크 자체에는 다음 턴으로 새지 않게 즉시 복원한다.
+            _ACTIVE_QUEUE_EVENT_ID.reset(context_token)
         return True
+
+    async def _is_claim_active(self, turn: Any, message_id: str) -> bool:
+        """주어진 claim이 DB에서도 여전히 유효한지 확인한다.
+
+        조회 실패·repo 미연결은 fail-closed다. 원격 HTTP 큐가 잠깐
+        불확실할 때 중복 게시하는 것보다 row를 reclaim 경로에 남기는 편이
+        안전하다.
+        """
+        if turn is None or self._repo is None:
+            logger.warning(
+                "[Queue] Delivery fence rejected missing claim context (event=%s)",
+                message_id or "<missing>",
+            )
+            return False
+        try:
+            active = await asyncio.to_thread(
+                self._repo.is_active_turn,
+                session_id=turn.session_id,
+                active_turn_id=turn.active_turn_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "[Queue] Delivery fence check failed (event=%s, session=%s): %s",
+                message_id,
+                turn.session_id,
+                exc,
+            )
+            return False
+        if not active:
+            logger.warning(
+                "[Queue] Delivery fence rejected stale claim (event=%s, session=%s)",
+                message_id,
+                turn.session_id,
+            )
+        return bool(active)
+
+    def _is_conversation_claim_active(
+        self,
+        turn: Any,
+        message_id: str,
+        delivery_token: Optional[str],
+    ) -> bool:
+        """v2 no-reply send 직전의 local token/lease fence.
+
+        실제 상태 전이는 server의 active token 비교가 최종 권위다. send는
+        외부 I/O 없는 no-reply sink지만, stale task가 정상 응답처럼 통과하지
+        않도록 task context token과 claim token, lease 시각을 모두 확인한다.
+        """
+        if not isinstance(turn, _ConversationTurn):
+            return False
+        if self._inflight.get(message_id) is not turn:
+            return False
+        if not delivery_token or delivery_token != turn.active_delivery_token:
+            logger.warning(
+                "[Queue] Conversation delivery token mismatch (event=%s)",
+                message_id or "<missing>",
+            )
+            return False
+        if datetime.now(timezone.utc) >= turn.lease_expires_at:
+            logger.warning(
+                "[Queue] Conversation delivery lease expired (event=%s)",
+                message_id,
+            )
+            return False
+        return True
+
+    async def _is_active_message_id(self, message_id: Optional[str]) -> bool:
+        """in-flight message ID를 DB active_turn_id 소유권으로 검증한다."""
+        message_id = str(message_id or "").strip()
+        turn = self._inflight.get(message_id) if message_id else None
+        if isinstance(turn, _ConversationTurn):
+            return self._is_conversation_claim_active(
+                turn,
+                message_id,
+                _ACTIVE_QUEUE_DELIVERY_TOKEN.get(),
+            )
+        return await self._is_claim_active(turn, message_id)
+
+    async def is_active_turn(self, event: MessageEvent) -> bool:
+        """GatewayRunner가 최종 응답 반환 직전에 호출하는 claim fence hook."""
+        return await self._is_active_message_id(getattr(event, "message_id", None))
 
     async def on_processing_complete(
         self, event: MessageEvent, outcome: ProcessingOutcome
@@ -461,12 +904,59 @@ class QueueAdapter(BasePlatformAdapter):
         SUCCESS = 에이전트 런과 응답 발신까지 끝남 -> done.
         FAILURE/CANCELLED -> error(유실 아님 — 상태로 가시화).
         """
-        turn = self._inflight.pop(event.message_id, None) if event.message_id else None
+        event_id = str(event.message_id or "")
+        turn = self._inflight.get(event_id) if event_id else None
         if turn is None:
             return
+        if isinstance(turn, _ConversationTurn):
+            # advance_delivery가 active token/expected_state/lease를 한
+            # transaction에서 검증한다. 실패한 stale worker는 상태를 쓰지 못하고,
+            # accepted row는 만료 뒤 새 worker가 재claim한다.
+            self._inflight.pop(event_id, None)
+            next_state = (
+                "completed"
+                if outcome is ProcessingOutcome.SUCCESS
+                else "error"
+            )
+            try:
+                await self._advance_conversation_delivery(
+                    turn,
+                    expected_state="accepted",
+                    next_state=next_state,
+                )
+                if _ACTIVE_QUEUE_EVENT_ID.get() == event_id:
+                    _ACTIVE_QUEUE_EVENT_ID.set(None)
+                    _ACTIVE_QUEUE_DELIVERY_TOKEN.set(None)
+            except Exception as exc:
+                logger.warning(
+                    "[Queue] Conversation completion fenced "
+                    "(event=%s, state=%s): %s",
+                    event_id,
+                    next_state,
+                    exc,
+                )
+            return
+        # run.py가 stale 결과를 None으로 억제하면 BasePlatformAdapter는 이를
+        # 정상 무응답으로 분류할 수 있다. DB 소유권을 여기서도 확인하지 않으면
+        # old worker가 새 owner의 row를 done으로 덮어쓴다. 소유권 상실 시에는
+        # 어떤 status도 쓰지 않고 새 owner/reclaim 경로에 그대로 맡긴다.
+        if not await self._is_claim_active(turn, event_id):
+            self._inflight.pop(event_id, None)
+            logger.warning(
+                "[Queue] Skipping completion write for stale claim (event=%s)",
+                event_id,
+            )
+            return
+        self._inflight.pop(event_id, None)
         try:
             if outcome is ProcessingOutcome.SUCCESS:
                 await asyncio.to_thread(self._repo.mark_inbox_done, turn.inbox_id)
+                # Main response is durably queued and the inbox row is done.
+                # BasePlatformAdapter's post-delivery callback runs after this
+                # hook; clear only this task's fence so that ordered goal/status
+                # notices may use their own outbound delivery path.
+                if _ACTIVE_QUEUE_EVENT_ID.get() == event_id:
+                    _ACTIVE_QUEUE_EVENT_ID.set(None)
             else:
                 await asyncio.to_thread(
                     self._repo.mark_inbox_error,
@@ -518,8 +1008,37 @@ class QueueAdapter(BasePlatformAdapter):
         thread_ts는 코어가 넣어주는 metadata["thread_id"](= source.thread_id)
         우선, 없으면 reply_to(트리거 메시지 ts)로 폴백한다.
         """
+        active_event_id = _ACTIVE_QUEUE_EVENT_ID.get()
+        if self._protocol_version == _CONVERSATION_PROTOCOL:
+            if chat_id != _NO_REPLY_CHANNEL:
+                return SendResult(
+                    success=False,
+                    error=(
+                        "conversation.v1 adapter is one-way; use queue_handoff "
+                        "for an explicit reverse handoff"
+                    ),
+                )
+            if active_event_id and not await self._is_active_message_id(active_event_id):
+                return SendResult(
+                    success=False,
+                    error="queue turn ownership lost before send",
+                )
+            # 코어의 일반 최종 응답은 v2 ledger/Slack outbox에 투영하지 않는다.
+            # 명시적인 역방향 queue_handoff만 별도 canonical event를 만든다.
+            return SendResult(
+                success=True,
+                message_id="conversation:no-reply",
+            )
+
         if self._repo is None:
             return SendResult(success=False, error="queue repo not connected")
+        if active_event_id and not await self._is_active_message_id(active_event_id):
+            # 실제 INSERT 바로 앞의 최종 fence. run.py의 반환 경계 검사와 함께
+            # 검증~BasePlatformAdapter.send 사이의 TOCTOU 창까지 닫는다.
+            return SendResult(
+                success=False,
+                error="queue turn ownership lost before send",
+            )
         thread_hint = (metadata.get("thread_id") if metadata else None) or reply_to
         try:
             result = await asyncio.to_thread(
@@ -538,7 +1057,7 @@ class QueueAdapter(BasePlatformAdapter):
 
 
 def _is_connected(config) -> bool:
-    """필수 설정(agent/repo_root + db_path 또는 endpoint)이 있어야 활성으로 판정."""
+    """선택한 protocol의 필수 설정이 모두 있을 때만 활성으로 판정."""
     extra = getattr(config, "extra", {}) or {}
 
     def _value(extra_key: str, env_name: str) -> str:
@@ -549,13 +1068,29 @@ def _is_connected(config) -> bool:
 
         return (gateway_mod.get_env_value(env_name) or "").strip()
 
-    required = [
-        ("agent", "QUEUE_AGENT"),
-        ("repo_root", "QUEUE_REPO_ROOT"),
-    ]
-    if not _value("endpoint", "QUEUE_ENDPOINT"):
-        required.insert(0, ("db_path", "QUEUE_DB_PATH"))
-    return all(_value(key, env) for key, env in required)
+    protocol = _value("protocol_version", "QUEUE_PROTOCOL_VERSION") or _LEGACY_PROTOCOL
+    if protocol not in _SUPPORTED_PROTOCOLS:
+        return False
+    if not all(
+        _value(key, env)
+        for key, env in (
+            ("agent", "QUEUE_AGENT"),
+            ("repo_root", "QUEUE_REPO_ROOT"),
+        )
+    ):
+        return False
+    if protocol == _CONVERSATION_PROTOCOL:
+        # credential은 config.extra가 아니라 profile private env에서만 읽는다.
+        import hermes_cli.gateway as gateway_mod
+
+        credential = (
+            gateway_mod.get_env_value("QUEUE_CONVERSATION_CREDENTIAL") or ""
+        ).strip()
+        return bool(_value("endpoint", "QUEUE_ENDPOINT") and credential)
+    return bool(
+        _value("endpoint", "QUEUE_ENDPOINT")
+        or _value("db_path", "QUEUE_DB_PATH")
+    )
 
 
 def _build_adapter(config):
@@ -598,6 +1133,16 @@ async def _standalone_send(
     token = _cfg("token", "QUEUE_TOKEN")
     agent = _cfg("agent", "QUEUE_AGENT")
     repo_root = _cfg("repo_root", "QUEUE_REPO_ROOT")
+    protocol = _cfg("protocol_version", "QUEUE_PROTOCOL_VERSION") or _LEGACY_PROTOCOL
+    if protocol == _CONVERSATION_PROTOCOL:
+        return {
+            "error": (
+                "conversation.v1 platform send is one-way; use queue_handoff "
+                "for a canonical outbound handoff"
+            )
+        }
+    if protocol != _LEGACY_PROTOCOL:
+        return {"error": f"Unsupported QUEUE_PROTOCOL_VERSION: {protocol}"}
     if not all([agent, repo_root]) or (not db_path and not endpoint):
         return {
             "error": "Queue not configured "

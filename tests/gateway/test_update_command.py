@@ -626,6 +626,29 @@ class TestSendUpdateNotification:
         assert "Update complete" in call_args[0][1] or "update finished" in call_args[0][1].lower()
 
     @pytest.mark.asyncio
+    async def test_sends_notification_with_workspace_scope(self, tmp_path):
+        runner = _make_runner()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / ".update_pending.json").write_text(json.dumps({
+            "platform": "slack",
+            "chat_id": "C_SHARED",
+            "scope_id": "T_APOM",
+        }))
+        (hermes_home / ".update_output.txt").write_text("done")
+        (hermes_home / ".update_exit_code").write_text("0")
+        mock_adapter = AsyncMock()
+        mock_adapter.send = AsyncMock()
+        runner.adapters = {Platform.SLACK: mock_adapter}
+
+        with patch("gateway.run._hermes_home", hermes_home):
+            await runner._send_update_notification()
+
+        assert mock_adapter.send.await_args.kwargs["metadata"] == {
+            "scope_id": "T_APOM"
+        }
+
+    @pytest.mark.asyncio
     async def test_sends_notification_with_thread_metadata(self, tmp_path):
         """Final update notification preserves thread metadata when present."""
         runner = _make_runner()

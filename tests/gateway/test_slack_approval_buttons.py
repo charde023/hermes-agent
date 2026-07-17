@@ -174,7 +174,7 @@ class TestSlackApprovalAction:
     async def test_resolves_approval(self):
         adapter = _make_adapter()
         _attach_auth_runner(adapter)
-        adapter._approval_resolved["1234.5678"] = False
+        adapter._approval_resolved[("T1", "C1", "1234.5678")] = False
 
         ack = AsyncMock()
         body = {
@@ -211,7 +211,7 @@ class TestSlackApprovalAction:
     async def test_prevents_double_click(self):
         adapter = _make_adapter()
         _attach_auth_runner(adapter)
-        adapter._approval_resolved["1234.5678"] = True  # Already resolved
+        adapter._approval_resolved[("T1", "C1", "1234.5678")] = True  # Already resolved
 
         ack = AsyncMock()
         body = {
@@ -235,7 +235,7 @@ class TestSlackApprovalAction:
     async def test_deny_action(self):
         adapter = _make_adapter()
         _attach_auth_runner(adapter)
-        adapter._approval_resolved["1.2"] = False
+        adapter._approval_resolved[("T1", "C1", "1.2")] = False
 
         ack = AsyncMock()
         body = {
@@ -260,7 +260,7 @@ class TestSlackApprovalAction:
     @pytest.mark.asyncio
     async def test_global_allowlist_blocks_unauthorized_click(self, monkeypatch):
         adapter = _make_adapter()
-        adapter._approval_resolved["1234.5678"] = False
+        adapter._approval_resolved[("T1", "C1", "1234.5678")] = False
         monkeypatch.delenv("SLACK_ALLOWED_USERS", raising=False)
         monkeypatch.delenv("SLACK_ALLOW_ALL_USERS", raising=False)
         monkeypatch.delenv("GATEWAY_ALLOW_ALL_USERS", raising=False)
@@ -367,7 +367,10 @@ class TestSlackThreadContext:
         })
 
         # Mock user name resolution
-        adapter._user_name_cache = {"U1": "Alice", "U2": "Bob"}
+        adapter._user_name_cache = {
+            ("T1", "U1"): "Alice",
+            ("T1", "U2"): "Bob",
+        }
 
         context = await adapter._fetch_thread_context(
             channel_id="C1",
@@ -414,7 +417,10 @@ class TestSlackThreadContext:
                 {"ts": "1000.2", "user": "U1", "text": "Current"},
             ]
         })
-        adapter._user_name_cache = {"U1": "Alice", "U_OTHER_BOT": "DeployBot"}
+        adapter._user_name_cache = {
+            ("T1", "U1"): "Alice",
+            ("T1", "U_OTHER_BOT"): "DeployBot",
+        }
 
         context = await adapter._fetch_thread_context(
             channel_id="C1", thread_ts="1000.0", current_ts="1000.2", team_id="T1"
@@ -467,7 +473,7 @@ class TestSlackThreadContext:
                 {"ts": "1000.1", "user": "U1", "text": "詳細を教えて"},
             ]
         })
-        adapter._user_name_cache = {"U1": "Alice"}
+        adapter._user_name_cache = {("T1", "U1"): "Alice"}
 
         context = await adapter._fetch_thread_context(
             channel_id="C1",
@@ -501,7 +507,7 @@ class TestSlackThreadContext:
                 {"ts": "1000.3", "user": "U1", "text": "Current"},
             ]
         })
-        adapter._user_name_cache = {"U1": "Alice"}
+        adapter._user_name_cache = {("T1", "U1"): "Alice"}
 
         context = await adapter._fetch_thread_context(
             channel_id="C1", thread_ts="1000.0", current_ts="1000.3", team_id="T1"
@@ -549,7 +555,7 @@ class TestSlackThreadContext:
                 {"ts": "2000.3", "user": "U2", "text": "Current"},
             ]
         })
-        adapter._user_name_cache = {"U2": "Bob"}
+        adapter._user_name_cache = {("T2", "U2"): "Bob"}
 
         context = await adapter._fetch_thread_context(
             channel_id="C2", thread_ts="2000.0", current_ts="2000.3", team_id="T2"
@@ -572,7 +578,7 @@ class TestSlackThreadContext:
                 {"ts": "1000.1", "user": "U1", "text": "DO NOT INCLUDE THIS"},
             ]
         })
-        adapter._user_name_cache = {"U1": "Alice"}
+        adapter._user_name_cache = {("T1", "U1"): "Alice"}
 
         context = await adapter._fetch_thread_context(
             channel_id="C1", thread_ts="1000.0", current_ts="1000.1", team_id="T1"
@@ -680,9 +686,9 @@ class TestThreadEngagement:
 
         await adapter.send(chat_id="C1", content="Hello!", metadata={"thread_id": "8000.0"})
 
-        assert "9000.1" in adapter._bot_message_ts
+        assert ("T1", "C1", "9000.1") in adapter._bot_message_ts
         # Thread root should also be tracked
-        assert "8000.0" in adapter._bot_message_ts
+        assert ("T1", "C1", "8000.0") in adapter._bot_message_ts
 
     @pytest.mark.asyncio
     async def test_bot_message_ts_cap(self):
