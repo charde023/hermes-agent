@@ -461,6 +461,26 @@ def _target_matches_origin(origin: dict, platform_name: str, chat_id: str,
     return True
 
 
+def _workspace_scope_from_origin(origin: dict) -> Optional[str]:
+    """Return a platform workspace scope carried by a saved cron origin.
+
+    Slack multi-workspace adapters need this scope for channel IDs that are not
+    globally unique. Older cron jobs may store any of these names depending on
+    which gateway surface created/edited them, so keep the lookup deliberately
+    additive and platform-neutral.
+    """
+    if not isinstance(origin, dict):
+        return None
+    for key in ("scope_id", "team_id", "guild_id", "workspace_id"):
+        value = origin.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
 def _maybe_mirror_cron_delivery(
     job: dict,
     platform_name: str,
@@ -822,11 +842,17 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
 
     if deliver_value == "origin":
         if origin:
-            return {
+            target = {
                 "platform": origin["platform"],
                 "chat_id": str(origin["chat_id"]),
                 "thread_id": origin.get("thread_id"),
             }
+            scope_id = _workspace_scope_from_origin(origin)
+            if scope_id:
+                target["scope_id"] = scope_id
+                target["team_id"] = scope_id
+                target["guild_id"] = scope_id
+            return target
         # Origin missing (e.g. job created via API/script) — try each
         # platform's home channel as a fallback instead of silently dropping.
         for platform_name in _iter_home_target_platforms():
@@ -879,11 +905,17 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
 
     platform_name = deliver_value
     if origin and origin.get("platform") == platform_name:
-        return {
+        target = {
             "platform": platform_name,
             "chat_id": str(origin["chat_id"]),
             "thread_id": origin.get("thread_id"),
         }
+        scope_id = _workspace_scope_from_origin(origin)
+        if scope_id:
+            target["scope_id"] = scope_id
+            target["team_id"] = scope_id
+            target["guild_id"] = scope_id
+        return target
 
     if not _is_known_delivery_platform(platform_name):
         return None
@@ -1156,6 +1188,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
+        target_scope_id = target.get("scope_id") or target.get("team_id") or target.get("guild_id")
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
@@ -1265,10 +1298,30 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # Media metadata mirrors the text routing so attachments land in
                 # the same DM topic instead of the General lane (#22773).
                 media_metadata = {"direct_messages_topic_id": str(thread_id)}
+                if target_scope_id:
+                    route_metadata["scope_id"] = str(target_scope_id)
+                    route_metadata["team_id"] = str(target_scope_id)
+                    route_metadata["guild_id"] = str(target_scope_id)
+                    media_metadata.update({
+                        "scope_id": str(target_scope_id),
+                        "team_id": str(target_scope_id),
+                        "guild_id": str(target_scope_id),
+                    })
             else:
                 route_thread_id = str(thread_id) if thread_id is not None else None
                 route_metadata = {"job_id": job["id"]}
                 media_metadata = {"thread_id": thread_id} if thread_id else None
+                if target_scope_id:
+                    route_metadata["scope_id"] = str(target_scope_id)
+                    route_metadata["team_id"] = str(target_scope_id)
+                    route_metadata["guild_id"] = str(target_scope_id)
+                    if media_metadata is None:
+                        media_metadata = {}
+                    media_metadata.update({
+                        "scope_id": str(target_scope_id),
+                        "team_id": str(target_scope_id),
+                        "guild_id": str(target_scope_id),
+                    })
 
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.
@@ -1470,7 +1523,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
         if not delivered:
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files, team_id=target_scope_id)
             try:
                 result = asyncio.run(coro)
             except RuntimeError:
@@ -1480,7 +1533,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # fresh thread that has no running loop.
                 coro.close()
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                    future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files, team_id=target_scope_id))
                     result = future.result(timeout=30)
             except Exception as e:
                 msg = f"delivery to {platform_name}:{chat_id} failed: {e}"

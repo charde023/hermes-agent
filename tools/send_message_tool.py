@@ -641,6 +641,7 @@ async def _send_via_adapter(
     thread_id=None,
     media_files=None,
     force_document=False,
+    team_id=None,
 ):
     """Send a message via a live gateway adapter, with a standalone fallback
     for out-of-process callers (e.g. cron running separately from the gateway).
@@ -671,6 +672,10 @@ async def _send_via_adapter(
                 metadata = {}
                 if thread_id:
                     metadata["thread_id"] = thread_id
+                if team_id:
+                    metadata["scope_id"] = str(team_id)
+                    metadata["team_id"] = str(team_id)
+                    metadata["guild_id"] = str(team_id)
                 if platform_name == "ntfy" and chat_id:
                     metadata["publish_topic"] = chat_id
                 if not metadata:
@@ -693,13 +698,18 @@ async def _send_via_adapter(
 
     if entry is not None and entry.standalone_sender_fn is not None:
         try:
+            send_kwargs = {
+                "thread_id": thread_id,
+                "media_files": media_files,
+                "force_document": force_document,
+            }
+            if team_id and platform_name == "slack":
+                send_kwargs["team_id"] = team_id
             result = await entry.standalone_sender_fn(
                 pconfig,
                 chat_id,
                 chunk,
-                thread_id=thread_id,
-                media_files=media_files,
-                force_document=force_document,
+                **send_kwargs,
             )
         except asyncio.CancelledError:
             raise
@@ -727,7 +737,7 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, team_id=None):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -966,7 +976,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 result = {"error": "Slack plugin not registered or missing standalone_sender_fn"}
             else:
                 result = await _slack_entry.standalone_sender_fn(
-                    pconfig, chat_id, chunk, thread_id=thread_id
+                    pconfig, chat_id, chunk, thread_id=thread_id, team_id=team_id
                 )
         elif platform == Platform.WHATSAPP:
             result = await _registry_standalone_send("whatsapp", pconfig, chat_id, chunk, thread_id)
@@ -999,6 +1009,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
                 media_files=media_files,
                 force_document=force_document,
+                team_id=team_id,
             )
 
         if isinstance(result, dict) and result.get("error"):
