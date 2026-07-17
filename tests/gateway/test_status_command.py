@@ -521,6 +521,59 @@ async def test_handle_message_discards_stale_result_after_session_invalidation(m
 
 
 @pytest.mark.asyncio
+async def test_handle_message_rechecks_generation_at_delivery_boundary(monkeypatch):
+    """초기 결과 검사를 통과한 뒤 stale이 되어도 최종 발송값은 반환하지 않는다."""
+    import gateway.run as gateway_run
+
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-late-stale",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner.session_store.load_transcript.return_value = [
+        {"role": "user", "content": "earlier"}
+    ]
+    session_key = session_entry.session_key
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "좀비 응답",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 80,
+            "input_tokens": 120,
+            "output_tokens": 45,
+            "model": "openai/test-model",
+        }
+    )
+
+    async def _invalidate_after_initial_guard(*_args, **_kwargs):
+        runner._invalidate_session_run_generation(
+            session_key,
+            reason="test_delivery_boundary",
+        )
+
+    runner._refresh_agent_cache_message_count = AsyncMock(
+        side_effect=_invalidate_after_initial_guard
+    )
+
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100000,
+    )
+
+    result = await runner._handle_message(_make_event("hello"))
+
+    assert result is None
+    runner._send_voice_reply.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_handle_message_stale_result_keeps_newer_generation_callback(monkeypatch):
     import gateway.run as gateway_run
 

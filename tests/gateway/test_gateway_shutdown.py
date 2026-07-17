@@ -145,7 +145,12 @@ async def test_gateway_stop_systemd_service_restart_exits_cleanly(tmp_path, monk
     monkeypatch.setenv("INVOCATION_ID", "systemd-test")
     runner._launch_systemd_restart_shortcut = MagicMock()
 
-    with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"):
+    # This is the systemd branch even when the suite itself runs on macOS.
+    # Pin the service-manager platform so the assertion does not accidentally
+    # exercise launchd's intentional non-zero restart contract.
+    with patch("gateway.run.sys.platform", "linux"), patch(
+        "gateway.status.remove_pid_file"
+    ), patch("gateway.status.write_runtime_status"):
         await runner.stop(restart=True, service_restart=True)
 
     runner._launch_systemd_restart_shortcut.assert_called_once_with()
@@ -195,6 +200,62 @@ async def test_restart_shutdown_warning_uses_restart_command_reply_anchor_for_ac
     assert metadata["telegram_dm_topic_reply_fallback"] is True
     assert metadata["direct_messages_topic_id"] == source.thread_id
     assert metadata["telegram_reply_to_message_id"] == "restart-command"
+
+
+@pytest.mark.asyncio
+async def test_home_shutdown_dedupe_is_workspace_scoped():
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.SLACK] = runner.config.platforms.pop(
+        Platform.TELEGRAM
+    )
+    runner.adapters = {Platform.SLACK: adapter}
+    runner._restart_requested = True
+
+    source = make_restart_source(chat_id="C_SHARED")
+    source.platform = Platform.SLACK
+    source.scope_id = "T_TEAM"
+    session_key = build_session_key(source)
+    runner.session_store._entries[session_key] = MagicMock(origin=source)
+    runner._running_agents = {session_key: MagicMock()}
+    runner.config.platforms[Platform.SLACK].home_channel = HomeChannel(
+        platform=Platform.SLACK,
+        chat_id="C_SHARED",
+        name="APOM Ops",
+        scope_id="T_APOM",
+    )
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert len(adapter.sent_calls) == 2
+    assert adapter.sent_calls[0][2] == {"scope_id": "T_TEAM"}
+    assert adapter.sent_calls[1][2] == {"scope_id": "T_APOM"}
+
+
+@pytest.mark.asyncio
+async def test_legacy_unscoped_home_dedupes_scoped_active_chat():
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.SLACK] = runner.config.platforms.pop(
+        Platform.TELEGRAM
+    )
+    runner.adapters = {Platform.SLACK: adapter}
+    runner._restart_requested = True
+
+    source = make_restart_source(chat_id="C_HOME")
+    source.platform = Platform.SLACK
+    source.scope_id = "T_ONLY"
+    session_key = build_session_key(source)
+    runner.session_store._entries[session_key] = MagicMock(origin=source)
+    runner._running_agents = {session_key: MagicMock()}
+    runner.config.platforms[Platform.SLACK].home_channel = HomeChannel(
+        platform=Platform.SLACK,
+        chat_id="C_HOME",
+        name="Legacy env home",
+    )
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert len(adapter.sent_calls) == 1
+    assert adapter.sent_calls[0][2] == {"scope_id": "T_ONLY"}
 
 
 @pytest.mark.asyncio

@@ -1084,6 +1084,74 @@ class TestWhatsAppSessionKeyConsistency:
         # DM logic: chat_id + thread_id, user_id never included
         assert key == "agent:main:telegram:dm:99:topic-1"
 
+    def test_slack_workspace_scope_isolates_identical_channel_threads(self):
+        """같은 Slack channel/thread ID라도 workspace가 다르면 세션을 공유하지 않는다."""
+        team = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C-SHARED",
+            chat_type="channel",
+            thread_id="171234.0001",
+            scope_id="T-TEAM",
+        )
+        apom = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C-SHARED",
+            chat_type="channel",
+            thread_id="171234.0001",
+            scope_id="T-APOM",
+        )
+
+        assert build_session_key(team) == (
+            "agent:main:slack:channel:C-SHARED:171234.0001:scope:T-TEAM"
+        )
+        assert build_session_key(apom) == (
+            "agent:main:slack:channel:C-SHARED:171234.0001:scope:T-APOM"
+        )
+        assert build_session_key(team) != build_session_key(apom)
+
+    def test_slack_without_scope_keeps_legacy_key(self):
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C1",
+            chat_type="channel",
+            thread_id="171234.0001",
+        )
+
+        assert build_session_key(source) == "agent:main:slack:channel:C1:171234.0001"
+
+    def test_slack_scope_reserves_empty_thread_slot_for_legacy_parser(self):
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="D1",
+            chat_type="dm",
+            scope_id="T-APOM",
+        )
+
+        key = build_session_key(source)
+        assert key == "agent:main:slack:dm:D1::scope:T-APOM"
+
+        # Background-delivery parsing still sees the historical first five
+        # fields and never mistakes the suffix marker for a thread id.
+        from gateway.run import _parse_session_key
+
+        parsed = _parse_session_key(key)
+        assert parsed is not None
+        assert parsed["platform"] == "slack"
+        assert parsed["chat_type"] == "dm"
+        assert parsed["chat_id"] == "D1"
+        assert parsed.get("thread_id") in {None, ""}
+
+    def test_non_slack_scope_keeps_existing_key_layout(self):
+        """scope wire field가 있어도 다른 플랫폼의 기존 session key 계약은 보존한다."""
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="guild-123",
+            chat_type="group",
+            scope_id="guild-123",
+        )
+
+        assert build_session_key(source) == "agent:main:discord:group:guild-123"
+
 
 class TestWhatsAppIdentifierPublicHelpers:
     """Contract tests for the public WhatsApp identifier helpers.

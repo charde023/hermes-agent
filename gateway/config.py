@@ -251,6 +251,11 @@ class HomeChannel:
     chat_id: str
     name: str  # Human-readable name for display
     thread_id: Optional[str] = None
+    # Optional tenant/workspace discriminator for platforms where channel IDs
+    # are only unique inside an installation (Slack team_id, Discord guild,
+    # relay scope, etc.). Keep this in durable config rather than env vars so
+    # proactive sends can select the exact installation after a restart.
+    scope_id: Optional[str] = None
     
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -260,6 +265,8 @@ class HomeChannel:
         }
         if self.thread_id:
             result["thread_id"] = self.thread_id
+        if self.scope_id:
+            result["scope_id"] = self.scope_id
         return result
     
     @classmethod
@@ -269,6 +276,7 @@ class HomeChannel:
             chat_id=str(data["chat_id"]),
             name=data.get("name", "Home"),
             thread_id=str(data["thread_id"]) if data.get("thread_id") else None,
+            scope_id=str(data["scope_id"]) if data.get("scope_id") else None,
         )
 
 
@@ -1425,6 +1433,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             chat_id=slack_home,
             name=os.getenv("SLACK_HOME_CHANNEL_NAME", ""),
             thread_id=os.getenv("SLACK_HOME_CHANNEL_THREAD_ID") or None,
+            scope_id=os.getenv("SLACK_HOME_CHANNEL_SCOPE_ID") or None,
         )
     
     # Signal
@@ -2067,6 +2076,11 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                         thread_id=(
                             str(home["thread_id"])
                             if home.get("thread_id")
+                            else None
+                        ),
+                        scope_id=(
+                            str(home["scope_id"])
+                            if home.get("scope_id")
                             else None
                         ),
                     )

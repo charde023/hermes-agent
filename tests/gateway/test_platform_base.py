@@ -2,6 +2,7 @@
 
 import os
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -18,7 +19,76 @@ from gateway.platforms.base import (
     validate_inbound_media_size,
     _log_safe_path,
     _prefix_within_utf16_limit,
+    _thread_metadata_for_source,
 )
+from gateway.config import Platform
+from gateway.session import SessionSource
+
+
+class TestWorkspaceScopePropagation:
+    def test_build_source_accepts_canonical_scope_id(self):
+        adapter = SimpleNamespace(platform=Platform.SLACK)
+
+        source = BasePlatformAdapter.build_source(
+            adapter,
+            chat_id="C1",
+            scope_id="T-APOM",
+        )
+
+        assert source.scope_id == "T-APOM"
+        assert source.guild_id == "T-APOM"
+
+    def test_build_source_keeps_legacy_guild_id_compatibility(self):
+        adapter = SimpleNamespace(platform=Platform.DISCORD)
+
+        source = BasePlatformAdapter.build_source(
+            adapter,
+            chat_id="C1",
+            guild_id="G-LEGACY",
+        )
+
+        assert source.scope_id == "G-LEGACY"
+        assert source.guild_id == "G-LEGACY"
+
+    def test_canonical_scope_id_wins_over_legacy_alias(self):
+        adapter = SimpleNamespace(platform=Platform.SLACK)
+
+        source = BasePlatformAdapter.build_source(
+            adapter,
+            chat_id="C1",
+            scope_id="T-CANONICAL",
+            guild_id="T-STALE",
+        )
+
+        assert source.scope_id == "T-CANONICAL"
+        assert source.guild_id == "T-CANONICAL"
+
+    def test_scope_is_preserved_without_thread_metadata(self):
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C1",
+            scope_id="T-APOM",
+        )
+
+        assert _thread_metadata_for_source(source) == {"scope_id": "T-APOM"}
+
+    def test_scope_and_thread_share_outbound_metadata(self):
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C1",
+            thread_id="171234.0001",
+            scope_id="T-APOM",
+        )
+
+        assert _thread_metadata_for_source(source) == {
+            "scope_id": "T-APOM",
+            "thread_id": "171234.0001",
+        }
+
+    def test_empty_scope_and_thread_still_return_no_metadata(self):
+        source = SessionSource(platform=Platform.SLACK, chat_id="C1")
+
+        assert _thread_metadata_for_source(source) is None
 
 
 class TestInboundMediaSizeCap:

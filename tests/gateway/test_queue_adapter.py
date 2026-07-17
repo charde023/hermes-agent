@@ -21,22 +21,44 @@ T10 통합: 진짜 handle_message 파이프라인(핸들러 -> send -> 훅) -> d
 """
 
 import asyncio
+import copy
+import json
 import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 # slack_agent 레포 루트(bridge 패키지 제공). 라이브 기본값은 스미스 로컬 체크아웃.
+_S1_WORKTREE = Path(
+    "/Users/charde023/workspace/slack_agent/.worktrees/slack-conversation-s2"
+)
+_DEFAULT_SLACK_AGENT_ROOT = (
+    _S1_WORKTREE
+    if (_S1_WORKTREE / "bridge" / "conversation_http.py").is_file()
+    else Path("/Users/charde023/workspace/slack_agent")
+)
 SLACK_AGENT_ROOT = os.environ.get(
-    "QUEUE_TEST_REPO_ROOT", "/Users/charde023/workspace/slack_agent"
+    "QUEUE_TEST_REPO_ROOT", str(_DEFAULT_SLACK_AGENT_ROOT)
 )
 _HAS_SLACK_AGENT = (
     Path(SLACK_AGENT_ROOT, "bridge", "local_repo.py").is_file()
     and Path(SLACK_AGENT_ROOT, "bridge", "agent_repo.py").is_file()
+)
+_HAS_CONVERSATION = (
+    Path(SLACK_AGENT_ROOT, "bridge", "conversation_http.py").is_file()
+    and Path(SLACK_AGENT_ROOT, "bridge", "conversation_contracts.py").is_file()
+    and Path(
+        SLACK_AGENT_ROOT,
+        "contracts",
+        "examples",
+        "agent-directory.v1.json",
+    ).is_file()
 )
 
 if _HAS_SLACK_AGENT and SLACK_AGENT_ROOT not in sys.path:
@@ -70,6 +92,8 @@ class QueueAdapterTestBase(unittest.TestCase):
         os.environ.pop("QUEUE_ALLOW_ALL_USERS", None)
         os.environ.pop("QUEUE_ENDPOINT", None)
         os.environ.pop("QUEUE_TOKEN", None)
+        os.environ.pop("QUEUE_PROTOCOL_VERSION", None)
+        os.environ.pop("QUEUE_CONVERSATION_CREDENTIAL", None)
 
     def make_adapter(self, env_overrides=None, remove=()):
         env = dict(env_overrides) if env_overrides else {}
@@ -554,6 +578,70 @@ class TestReclaimStaleClaimed(QueueAdapterTestBase):
         self.assertEqual(self.inbox_row("1700000061.000100")["status"], "claimed")
 
 
+class TestActiveTurnFence(QueueAdapterTestBase):
+    """발송 직전 claim 소유권 확인 — reclaim 좀비는 fail-closed."""
+
+    def _claimed_event(self):
+        from gateway.platforms.base import MessageEvent
+
+        repo = self.make_repo()
+        repo.insert_inbox(
+            slack_event_ts="1700000062.000100",
+            channel_id="C0B69KP8G2J",
+            thread_ts="1700000062.000100",
+            slack_user_id="U0CHAD",
+            text="펜싱 대상 턴",
+            target="chami",
+        )
+        adapter = self.make_adapter()
+        adapter._repo = repo
+        turn = repo.claim_session_turn(
+            target="chami", worker=adapter._worker, ttl_seconds=600
+        )
+        self.assertIsNotNone(turn)
+        source = adapter.build_source(
+            chat_id="queue:C0B69KP8G2J",
+            chat_type="channel",
+            user_id="U0CHAD",
+            thread_id=turn.thread_ts,
+        )
+        event = MessageEvent(
+            text=turn.text,
+            source=source,
+            message_id=turn.slack_event_ts,
+        )
+        adapter._inflight[event.message_id] = turn
+        return repo, adapter, turn, event
+
+    def test_current_claim_is_active(self):
+        _repo, adapter, _turn, event = self._claimed_event()
+
+        self.assertTrue(asyncio.run(adapter.is_active_turn(event)))
+
+    def test_released_claim_is_inactive(self):
+        repo, adapter, turn, event = self._claimed_event()
+        repo.release_session_lock(
+            session_id=turn.session_id,
+            worker=adapter._worker,
+        )
+
+        self.assertFalse(asyncio.run(adapter.is_active_turn(event)))
+
+    def test_missing_claim_context_fails_closed(self):
+        _repo, adapter, _turn, event = self._claimed_event()
+        adapter._inflight.clear()
+
+        self.assertFalse(asyncio.run(adapter.is_active_turn(event)))
+
+    def test_repo_check_error_fails_closed(self):
+        _repo, adapter, _turn, event = self._claimed_event()
+        adapter._repo.is_active_turn = MagicMock(
+            side_effect=RuntimeError("queue server unavailable")
+        )
+
+        self.assertFalse(asyncio.run(adapter.is_active_turn(event)))
+
+
 class TestEndToEndCoreDispatch(QueueAdapterTestBase):
     """T10: 진짜 base.handle_message 파이프라인 통과 — 스폰된 백그라운드 처리에서
     핸들러 실행 -> send(outbox INSERT) -> on_processing_complete 훅 -> done."""
@@ -606,6 +694,46 @@ class TestEndToEndCoreDispatch(QueueAdapterTestBase):
         self.assertEqual(rows[0]["thread_ts"], "1700000070.000001")
         self.assertIn("퐁 응답이야", rows[0]["text"])
         self.assertNotIn("1700000070.000100", adapter._inflight)
+
+    def test_reclaimed_turn_cannot_write_outbox(self):
+        repo = self.make_repo()
+        repo.insert_inbox(
+            slack_event_ts="1700000071.000100",
+            channel_id="C0B69KP8G2J",
+            thread_ts="1700000071.000001",
+            slack_user_id="U0CHAD",
+            text="늦게 끝나는 턴",
+            target="chami",
+        )
+
+        adapter = self.make_adapter()
+        adapter._repo = repo
+
+        async def handler(event):
+            turn = adapter._inflight[event.message_id]
+            # 모델 실행이 끝나기 직전 다른 워커가 TTL claim을 탈취한 상황을 흉내낸다.
+            repo.release_session_lock(
+                session_id=turn.session_id,
+                worker=adapter._worker,
+            )
+            return "게시되면 안 되는 좀비 응답"
+
+        adapter.set_message_handler(handler)
+
+        async def scenario():
+            self.assertTrue(await adapter._poll_once())
+            for _ in range(200):
+                if "1700000071.000100" not in adapter._inflight:
+                    break
+                await asyncio.sleep(0.05)
+            await asyncio.sleep(0.2)
+
+        asyncio.run(scenario())
+
+        row = self.inbox_row("1700000071.000100")
+        # stale worker는 새 owner/reclaim 대상 row의 status도 덮어쓰지 않는다.
+        self.assertEqual(row["status"], "claimed")
+        self.assertEqual(len(self.outbox_rows()), 0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -983,3 +1111,353 @@ class TestM2DHandoffReplyRouting(M1TestBase):
         self.assertEqual(len(self.inbox_by_target("chami")), 0)
         self.assertEqual(self.inbox_count(), 1)
         self.assertEqual(len(self.outbox_rows()), 0)
+
+
+def _conversation_fixture():
+    root = Path(SLACK_AGENT_ROOT)
+    event = json.loads(
+        (root / "contracts" / "examples" / "conversation-event.queue.v1.json")
+        .read_text(encoding="utf-8")
+    )
+    event["delivery_status"] = "claimed"
+    directory = json.loads(
+        (root / "contracts" / "examples" / "agent-directory.v1.json")
+        .read_text(encoding="utf-8")
+    )
+    return event, directory
+
+
+class _FakeConversationClient:
+    """conversation HTTP client의 동기 call 계약을 기록하는 테스트 대역."""
+
+    def __init__(self, claim=None):
+        self.claim = copy.deepcopy(claim)
+        self.calls = []
+        self.advance_error = None
+
+    def call(self, method, params):
+        self.calls.append((method, copy.deepcopy(dict(params))))
+        if method == "claim_delivery":
+            claim, self.claim = self.claim, None
+            return copy.deepcopy(claim)
+        if method == "advance_delivery":
+            if self.advance_error is not None:
+                raise self.advance_error
+            return {"updated": True, "delivery_status": params["next_state"]}
+        raise AssertionError(f"unexpected conversation method: {method}")
+
+
+@unittest.skipUnless(
+    _HAS_CONVERSATION,
+    f"conversation.v1 slack_agent contract not found: {SLACK_AGENT_ROOT}",
+)
+class TestConversationV1Adapter(QueueAdapterTestBase):
+    """v2: canonical event claim -> accepted -> completed/error와 token fencing."""
+
+    def make_claim(self, *, event=None, lease_seconds=600):
+        canonical, _directory = _conversation_fixture()
+        event = copy.deepcopy(event or canonical)
+        return {
+            "event_id": event["event_id"],
+            "conversation_id": event["conversation_id"],
+            "target_agent_id": "chami",
+            "worker": "queue-adapter-chami-test",
+            "active_delivery_token": "delivery-token-1",
+            "lease_expires_at": (
+                datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
+            ).isoformat(),
+            "event": event,
+        }
+
+    def make_v2_adapter(self, claim):
+        adapter = self.make_adapter(
+            env_overrides={
+                "QUEUE_PROTOCOL_VERSION": "conversation.v1",
+                "QUEUE_ENDPOINT": "http://127.0.0.1:8770",
+                "QUEUE_CONVERSATION_CREDENTIAL": "conversation-secret",
+            }
+        )
+        claim = copy.deepcopy(claim)
+        claim["worker"] = adapter._worker
+        _event, directory = _conversation_fixture()
+        adapter._conversation_directory = directory
+        adapter._conversation_client = _FakeConversationClient(claim)
+        return adapter
+
+    def advance_states(self, adapter):
+        return [
+            params["next_state"]
+            for method, params in adapter._conversation_client.calls
+            if method == "advance_delivery"
+        ]
+
+    def test_claim_dispatches_canonical_event_then_completes(self):
+        claim = self.make_claim()
+        adapter = self.make_v2_adapter(claim)
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture
+
+        async def scenario():
+            self.assertTrue(await adapter._poll_once())
+            self.assertEqual(self.advance_states(adapter), ["accepted"])
+            self.assertEqual(len(captured), 1)
+            event = captured[0]
+            self.assertEqual(event.text, claim["event"]["body"])
+            self.assertEqual(event.message_id, claim["event_id"])
+            self.assertEqual(event.source.chat_id, "queue:no-reply")
+            self.assertEqual(event.source.thread_id, claim["conversation_id"])
+            self.assertEqual(event.source.user_id, "chadol")
+            self.assertTrue(event.internal)
+            self.assertEqual(event.raw_message, claim["event"])
+            self.assertEqual(
+                event.metadata["active_delivery_token"], "delivery-token-1"
+            )
+            await adapter.on_processing_complete(event, self.outcome("SUCCESS"))
+
+        asyncio.run(scenario())
+        self.assertEqual(self.advance_states(adapter), ["accepted", "completed"])
+        self.assertNotIn(claim["event_id"], adapter._inflight)
+
+    def test_processing_failure_advances_delivery_to_error(self):
+        claim = self.make_claim()
+        adapter = self.make_v2_adapter(claim)
+        captured = []
+        adapter.handle_message = self.completing_handle(adapter, captured)
+
+        async def failing(event):
+            captured.append(event)
+            await adapter.on_processing_complete(event, self.outcome("FAILURE"))
+
+        adapter.handle_message = failing
+        self.assertTrue(asyncio.run(adapter._poll_once()))
+        self.assertEqual(self.advance_states(adapter), ["accepted", "error"])
+
+    def test_missing_payload_fails_closed_and_errors_owned_claim(self):
+        claim = self.make_claim()
+        del claim["event"]
+        adapter = self.make_v2_adapter(claim)
+        adapter._message_handler = MagicMock()
+
+        self.assertTrue(asyncio.run(adapter._poll_once()))
+
+        adapter._message_handler.assert_not_called()
+        self.assertEqual(self.advance_states(adapter), ["error"])
+        _method, params = adapter._conversation_client.calls[-1]
+        self.assertEqual(params["expected_state"], "claimed")
+        self.assertEqual(params["active_token"], "delivery-token-1")
+
+    def test_event_identity_target_and_protocol_mismatch_fail_closed(self):
+        canonical, _directory = _conversation_fixture()
+        mutations = (
+            ("event_id", "evt-tampered"),
+            ("target_agent_ids", ["smith"]),
+            ("protocol_version", "conversation.v9"),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field):
+                event = copy.deepcopy(canonical)
+                event[field] = value
+                claim = self.make_claim(event=event)
+                if field == "event_id":
+                    claim["event_id"] = canonical["event_id"]
+                adapter = self.make_v2_adapter(claim)
+                adapter._message_handler = MagicMock()
+
+                self.assertTrue(asyncio.run(adapter._poll_once()))
+                adapter._message_handler.assert_not_called()
+                self.assertEqual(self.advance_states(adapter), ["error"])
+
+    def test_no_reply_send_checks_context_delivery_token(self):
+        claim = self.make_claim()
+        adapter = self.make_v2_adapter(claim)
+        results = []
+
+        async def send_from_active_turn(event):
+            results.append(await adapter.send(event.source.chat_id, "표시하지 않을 답"))
+
+        adapter.handle_message = send_from_active_turn
+        self.assertTrue(asyncio.run(adapter._poll_once()))
+
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].success)
+        self.assertEqual(results[0].message_id, "conversation:no-reply")
+        self.assertIsNone(adapter._repo)
+
+    def test_wrong_context_delivery_token_rejects_send(self):
+        claim = self.make_claim()
+        adapter = self.make_v2_adapter(claim)
+        results = []
+
+        async def send_with_wrong_token(event):
+            from plugins.platforms.queue.adapter import _ACTIVE_QUEUE_DELIVERY_TOKEN
+
+            token = _ACTIVE_QUEUE_DELIVERY_TOKEN.set("stale-token")
+            try:
+                results.append(await adapter.send(event.source.chat_id, "좀비 답"))
+            finally:
+                _ACTIVE_QUEUE_DELIVERY_TOKEN.reset(token)
+
+        adapter.handle_message = send_with_wrong_token
+        self.assertTrue(asyncio.run(adapter._poll_once()))
+
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0].success)
+        self.assertIn("ownership lost", results[0].error)
+
+    def test_invalid_claim_target_does_not_attempt_error_transition(self):
+        claim = self.make_claim()
+        claim["target_agent_id"] = "chadol"
+        adapter = self.make_v2_adapter(claim)
+        adapter._message_handler = MagicMock()
+
+        self.assertTrue(asyncio.run(adapter._poll_once()))
+
+        self.assertEqual(
+            [method for method, _params in adapter._conversation_client.calls],
+            ["claim_delivery"],
+        )
+
+    def test_completion_transition_failure_is_fenced_and_not_retried_locally(self):
+        claim = self.make_claim()
+        adapter = self.make_v2_adapter(claim)
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture
+
+        async def scenario():
+            self.assertTrue(await adapter._poll_once())
+            adapter._conversation_client.advance_error = RuntimeError(
+                "delivery lease ownership lost"
+            )
+            await adapter.on_processing_complete(captured[0], self.outcome("SUCCESS"))
+
+        asyncio.run(scenario())
+        self.assertNotIn(claim["event_id"], adapter._inflight)
+        self.assertEqual(self.advance_states(adapter), ["accepted", "completed"])
+
+    def test_real_s1_http_claim_payload_reaches_completed(self):
+        """실 server/client/ledger에서 claim.event shape와 상태 전이를 고정한다."""
+        from bridge.conversation_auth import AuthenticationError, ConversationAuthorizer
+        from bridge.conversation_contracts import load_contract_bundle
+        from bridge.conversation_http import HttpConversationClient, dispatch_conversation
+        from bridge.conversation_ledger import SQLiteConversationLedger
+        from bridge.queue_server import make_server
+        from bridge.repo import InMemoryQueueRepo
+
+        bundle = load_contract_bundle(Path(SLACK_AGENT_ROOT) / "contracts")
+        ledger = SQLiteConversationLedger(
+            str(Path(self.db_path).with_name("conversation-ledger.sqlite3")),
+            directory=bundle.directory,
+        )
+        authorizer = ConversationAuthorizer(bundle.directory)
+        principals = {
+            "credential-chadol": "chadol",
+            "credential-chami": "chami",
+        }
+
+        def authenticate(provided):
+            try:
+                return principals[provided]
+            except KeyError as exc:
+                raise AuthenticationError("invalid credential") from exc
+
+        server = make_server(
+            InMemoryQueueRepo(),
+            host="127.0.0.1",
+            port=0,
+            conversation_authenticate=authenticate,
+            conversation_dispatch=lambda principal, method, params: dispatch_conversation(
+                ledger, authorizer, principal, method, params
+            ),
+        )
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        endpoint = f"http://127.0.0.1:{server.server_address[1]}"
+        captured = []
+        try:
+            sender = HttpConversationClient(endpoint, "credential-chadol")
+            receipt = sender.call("append_event", {"event": bundle.queue_event})
+            self.assertEqual(receipt["delivery_status"], "pending")
+
+            adapter = self.make_adapter(
+                env_overrides={
+                    "QUEUE_AGENT": "chami",
+                    "QUEUE_PROTOCOL_VERSION": "conversation.v1",
+                    "QUEUE_ENDPOINT": endpoint,
+                    "QUEUE_CONVERSATION_CREDENTIAL": "credential-chami",
+                }
+            )
+            adapter._conversation_client = HttpConversationClient(
+                endpoint, "credential-chami"
+            )
+            adapter._conversation_directory = bundle.directory
+
+            async def capture(event):
+                captured.append(event)
+
+            adapter.handle_message = capture
+
+            async def scenario():
+                self.assertTrue(await adapter._poll_once())
+                await adapter.on_processing_complete(
+                    captured[0], self.outcome("SUCCESS")
+                )
+
+            asyncio.run(scenario())
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(timeout=5)
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0].raw_message, bundle.queue_event)
+        self.assertEqual(
+            ledger.get_event_status(bundle.queue_event["event_id"]), "completed"
+        )
+
+
+@unittest.skipUnless(
+    _HAS_CONVERSATION,
+    f"conversation.v1 slack_agent contract not found: {SLACK_AGENT_ROOT}",
+)
+class TestConversationV1Configuration(QueueAdapterTestBase):
+    def test_v2_requires_endpoint_and_dedicated_credential(self):
+        for missing in ("QUEUE_ENDPOINT", "QUEUE_CONVERSATION_CREDENTIAL"):
+            with self.subTest(missing=missing):
+                adapter = self.make_adapter(
+                    env_overrides={
+                        "QUEUE_PROTOCOL_VERSION": "conversation.v1",
+                        "QUEUE_ENDPOINT": "http://127.0.0.1:8770",
+                        "QUEUE_CONVERSATION_CREDENTIAL": "secret",
+                    },
+                    remove=(missing,),
+                )
+                adapter._message_handler = MagicMock()
+                self.assertFalse(asyncio.run(adapter.connect()))
+                self.assertIn(missing, adapter._fatal_error_message)
+
+    def test_unknown_protocol_is_nonretryable_fatal(self):
+        adapter = self.make_adapter(
+            env_overrides={"QUEUE_PROTOCOL_VERSION": "conversation.v9"}
+        )
+        adapter._message_handler = MagicMock()
+
+        self.assertFalse(asyncio.run(adapter.connect()))
+        self.assertEqual(adapter._fatal_error_code, "queue_unsupported_protocol")
+        self.assertFalse(adapter._fatal_error_retryable)
+
+    def test_plugin_manifest_exposes_v2_without_secret_value(self):
+        manifest = (
+            Path(__file__).parents[2] / "plugins" / "platforms" / "queue" / "plugin.yaml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("QUEUE_PROTOCOL_VERSION", manifest)
+        self.assertIn("QUEUE_CONVERSATION_CREDENTIAL", manifest)
+        self.assertNotIn("conversation-secret", manifest)

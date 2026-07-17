@@ -226,6 +226,101 @@ def _non_conversational_metadata(
     return merged
 
 
+def _delivery_target_key(
+    platform: Any,
+    chat_id: Any,
+    thread_id: Any = None,
+    scope_id: Any = None,
+) -> tuple:
+    """Return a backward-compatible, tenant-aware delivery identity.
+
+    Legacy single-workspace targets stay three-tuples so persisted/test caller
+    sets remain compatible. Scoped targets add the workspace discriminator as
+    a fourth field; identical Slack channel/thread IDs in two workspaces must
+    never suppress one another's proactive notification.
+    """
+    base = (
+        _gateway_platform_value(platform),
+        str(chat_id),
+        str(thread_id) if thread_id else None,
+    )
+    return (*base, str(scope_id)) if scope_id else base
+
+
+def _delivery_target_seen(target: tuple, candidates: set[tuple]) -> bool:
+    """Check dedupe membership without letting scoped workspaces collide.
+
+    A legacy unscoped target keeps its historical wildcard behavior so a
+    single-workspace env home does not duplicate an already-notified scoped
+    active chat. A scoped target, however, only matches its exact four-tuple.
+    """
+    if target in candidates:
+        return True
+    if len(target) == 3:
+        return any(candidate[:3] == target for candidate in candidates)
+    return False
+
+
+def _configured_home_channels(config: Any, platform: Any) -> list[Any]:
+    """Return every proactive home target for one platform.
+
+    ``PlatformConfig.home_channel`` remains the generic/legacy target. Slack
+    may additionally configure one home per installation through
+    ``workspace_home_channels``. Those entries are promoted to scoped
+    ``HomeChannel`` values so startup/shutdown reports never choose a bot
+    client by channel ID alone.
+    """
+    base = config.get_home_channel(platform)
+    workspace_homes: list[Any] = []
+    platform_cfg = getattr(config, "platforms", {}).get(platform)
+    extra = getattr(platform_cfg, "extra", None)
+    if _gateway_platform_value(platform) == "slack" and isinstance(extra, dict):
+        raw_homes = extra.get("workspace_home_channels")
+        if isinstance(raw_homes, dict):
+            for raw_scope, raw_chat_id in raw_homes.items():
+                scope_id = str(raw_scope or "").strip()
+                chat_id = str(raw_chat_id or "").strip()
+                if scope_id and chat_id:
+                    workspace_homes.append(
+                        HomeChannel(
+                            platform=platform,
+                            chat_id=chat_id,
+                            name=f"Slack workspace {scope_id}",
+                            scope_id=scope_id,
+                        )
+                    )
+
+    # A legacy Slack home often points at one of the scoped homes. Upgrade it
+    # when the channel belongs to exactly one configured installation; leaving
+    # it unscoped would fail closed after a second token is added.
+    if base and not getattr(base, "scope_id", None) and workspace_homes:
+        matches = [home for home in workspace_homes if home.chat_id == base.chat_id]
+        if len(matches) == 1:
+            base = HomeChannel(
+                platform=platform,
+                chat_id=str(base.chat_id),
+                name=base.name,
+                thread_id=base.thread_id,
+                scope_id=matches[0].scope_id,
+            )
+
+    homes = ([base] if base and base.chat_id else []) + workspace_homes
+    unique: list[Any] = []
+    seen: set[tuple] = set()
+    for home in homes:
+        key = _delivery_target_key(
+            platform,
+            home.chat_id,
+            home.thread_id,
+            home.scope_id,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(home)
+    return unique
+
+
 def _is_transient_network_error(exc: BaseException) -> bool:
     """Return True for transient network errors safe to log + swallow.
 
@@ -1230,6 +1325,11 @@ def _home_target_env_var(platform_name: str) -> str:
 def _home_thread_env_var(platform_name: str) -> str:
     """Return the optional thread/topic env var for a platform home target."""
     return f"{_home_target_env_var(platform_name)}_THREAD_ID"
+
+
+def _home_scope_env_var(platform_name: str) -> str:
+    """Return the optional tenant/workspace env var for a platform home target."""
+    return f"{_home_target_env_var(platform_name)}_SCOPE_ID"
 
 
 def _restart_notification_pending() -> bool:
@@ -5151,7 +5251,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         msg = f"⚠️ Gateway {action} — {hint}"
 
-        notified: set[tuple[str, str, Optional[str]]] = set()
+        notified: set[tuple] = set()
         for session_key in active:
             source = None
             try:
@@ -5173,6 +5273,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 platform_str = source.platform.value
                 chat_id = str(source.chat_id)
                 thread_id = source.thread_id
+                scope_id = getattr(source, "scope_id", None)
             else:
                 # Fall back to parsing the session key when no persisted
                 # origin is available (legacy sessions/tests).
@@ -5182,12 +5283,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 platform_str = _parsed["platform"]
                 chat_id = _parsed["chat_id"]
                 thread_id = _parsed.get("thread_id")
+                scope_id = None
 
             # Deduplicate only identical delivery targets. Thread/topic-aware
             # platforms can share a parent chat while still routing to distinct
             # destinations via metadata.
-            dedup_key = (platform_str, chat_id, str(thread_id) if thread_id else None)
-            if dedup_key in notified:
+            dedup_key = _delivery_target_key(
+                platform_str,
+                chat_id,
+                thread_id,
+                scope_id,
+            )
+            if _delivery_target_seen(dedup_key, notified):
                 continue
 
             try:
@@ -5210,7 +5317,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         restart_platform = restart_source.platform.value
                         restart_chat_id = str(restart_source.chat_id)
                         restart_thread_id = str(restart_source.thread_id) if restart_source.thread_id else None
-                        if (restart_platform, restart_chat_id, restart_thread_id) == dedup_key:
+                        restart_target = _delivery_target_key(
+                            restart_platform,
+                            restart_chat_id,
+                            restart_thread_id,
+                            getattr(restart_source, "scope_id", None),
+                        )
+                        if restart_target == dedup_key:
                             reply_to_message_id = getattr(restart_source, "message_id", None)
                     except Exception:
                         pass
@@ -5222,6 +5335,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_type=getattr(source, "chat_type", None) if source is not None else None,
                     reply_to_message_id=reply_to_message_id,
                     adapter=adapter,
+                    scope_id=scope_id,
                 )
 
                 result = await adapter.send(chat_id, msg, metadata=metadata)
@@ -5281,8 +5395,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # ``RuntimeError: dictionary changed size during iteration`` —
         # observed in a user report during gateway shutdown.
         for platform, adapter in list(self.adapters.items()):
-            home = self.config.get_home_channel(platform)
-            if not home or not home.chat_id:
+            homes = _configured_home_channels(self.config, platform)
+            if not homes:
                 continue
 
             platform_cfg = self.config.platforms.get(platform)
@@ -5293,43 +5407,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 continue
 
-            dedup_key = (platform.value, str(home.chat_id), str(home.thread_id) if home.thread_id else None)
-            if dedup_key in notified:
-                continue
-
-            try:
-                metadata = self._thread_metadata_for_target(
+            for home in homes:
+                dedup_key = _delivery_target_key(
                     platform,
                     home.chat_id,
                     home.thread_id,
-                    adapter=adapter,
+                    home.scope_id,
                 )
-                if metadata:
-                    result = await adapter.send(str(home.chat_id), msg, metadata=metadata)
-                else:
-                    result = await adapter.send(str(home.chat_id), msg)
-                if result is not None and getattr(result, "success", True) is False:
+                if _delivery_target_seen(dedup_key, notified):
+                    continue
+
+                try:
+                    metadata = self._thread_metadata_for_target(
+                        platform,
+                        home.chat_id,
+                        home.thread_id,
+                        adapter=adapter,
+                        scope_id=home.scope_id,
+                    )
+                    if metadata:
+                        result = await adapter.send(
+                            str(home.chat_id), msg, metadata=metadata
+                        )
+                    else:
+                        result = await adapter.send(str(home.chat_id), msg)
+                    if result is not None and getattr(result, "success", True) is False:
+                        logger.debug(
+                            "Failed to send shutdown notification to home channel %s:%s: %s",
+                            platform.value,
+                            home.chat_id,
+                            getattr(result, "error", "send returned success=False"),
+                        )
+                        continue
+
+                    notified.add(dedup_key)
+                    logger.info(
+                        "Sent shutdown notification to home channel %s:%s",
+                        platform.value,
+                        home.chat_id,
+                    )
+                except Exception as e:
                     logger.debug(
                         "Failed to send shutdown notification to home channel %s:%s: %s",
                         platform.value,
                         home.chat_id,
-                        getattr(result, "error", "send returned success=False"),
+                        e,
                     )
-                    continue
-
-                notified.add(dedup_key)
-                logger.info(
-                    "Sent shutdown notification to home channel %s:%s",
-                    platform.value,
-                    home.chat_id,
-                )
-            except Exception as e:
-                logger.debug(
-                    "Failed to send shutdown notification to home channel %s:%s: %s",
-                    platform.value,
-                    home.chat_id,
-                    e,
-                )
 
     async def _finalize_shutdown_agents(self, active_agents: Dict[str, Any]) -> None:
         for agent in active_agents.values():
@@ -6886,6 +7009,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_id=dest_user_id,
             user_name="Handoff",
             thread_id=effective_thread_id,
+            scope_id=home.scope_id,
         )
 
         # Compute the gateway's session_key for that destination using the
@@ -6960,6 +7084,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         send_metadata: Dict[str, Any] = {}
         if effective_thread_id:
             send_metadata["thread_id"] = effective_thread_id
+        if home.scope_id:
+            send_metadata["scope_id"] = str(home.scope_id)
         try:
             result = await adapter.send(
                 chat_id=str(home.chat_id),
@@ -10661,14 +10787,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _quick_key or "?",
                     run_generation,
                 )
-                _stale_adapter = self.adapters.get(source.platform)
-                if getattr(type(_stale_adapter), "pop_post_delivery_callback", None) is not None:
-                    _stale_adapter.pop_post_delivery_callback(
-                        _quick_key,
-                        generation=run_generation,
-                    )
-                elif _stale_adapter and hasattr(_stale_adapter, "_post_delivery_callbacks"):
-                    _stale_adapter._post_delivery_callbacks.pop(_quick_key, None)
+                self._discard_stale_delivery_callback(
+                    source,
+                    _quick_key,
+                    run_generation,
+                )
                 return None
 
             response = agent_result.get("final_response") or ""
@@ -11111,10 +11234,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 response = ""
 
+            # This is the last common boundary before any user-visible
+            # delivery. The earlier generation check protects transcript
+            # mutation; this second check closes the awaits that followed it
+            # and, for durable Queue turns, verifies DB active_turn_id too.
+            if not await self._is_delivery_turn_current(
+                event,
+                _quick_key,
+                run_generation,
+            ):
+                logger.info(
+                    "Discarding stale delivery for %s — generation or durable claim is no longer current",
+                    _quick_key or "?",
+                )
+                self._discard_stale_delivery_callback(
+                    source,
+                    _quick_key,
+                    run_generation,
+                )
+                return None
+
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
-            if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
+            _voice_sent = self._should_send_voice_reply(
+                event,
+                response,
+                agent_messages,
+                already_sent=_already_sent,
+            )
+            if _voice_sent:
                 await self._send_voice_reply(event, response)
+                # Voice delivery awaited platform I/O. Fence the subsequent
+                # text return again so a reclaim during that await cannot leak
+                # the same turn's stale text response.
+                if not await self._is_delivery_turn_current(
+                    event,
+                    _quick_key,
+                    run_generation,
+                ):
+                    self._discard_stale_delivery_callback(
+                        source,
+                        _quick_key,
+                        run_generation,
+                    )
+                    return None
 
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming
@@ -11139,6 +11302,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Send it now as a small trailing message so Telegram/Discord/etc.
                 # still surface the runtime metadata on the final reply.
                 if _footer_line:
+                    if not await self._is_delivery_turn_current(
+                        event,
+                        _quick_key,
+                        run_generation,
+                    ):
+                        self._discard_stale_delivery_callback(
+                            source,
+                            _quick_key,
+                            run_generation,
+                        )
+                        return None
                     try:
                         _foot_adapter = self.adapters.get(source.platform)
                         if _foot_adapter:
@@ -13212,6 +13386,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             getattr(source, "thread_id", None),
             chat_type=getattr(source, "chat_type", None),
             reply_to_message_id=reply_to_message_id or getattr(source, "message_id", None),
+            scope_id=getattr(source, "scope_id", None),
         )
 
     def _thread_metadata_for_target(
@@ -13223,11 +13398,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         chat_type: Optional[str] = None,
         reply_to_message_id: Optional[str] = None,
         adapter: Optional[Any] = None,
+        scope_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Build thread metadata for synthetic sends that only have routing state."""
+        metadata: Dict[str, Any] = {}
+        if scope_id:
+            metadata["scope_id"] = str(scope_id)
         if thread_id is None:
-            return None
-        metadata: Dict[str, Any] = {"thread_id": thread_id}
+            return metadata or None
+        metadata["thread_id"] = thread_id
         if self._is_telegram_dm_topic_target(
             platform,
             chat_id,
@@ -13358,6 +13537,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key = pending.get("session_key")
                     thread_id = pending.get("thread_id")
                     message_id = pending.get("message_id")
+                    scope_id = pending.get("scope_id")
                     if platform_str and chat_id:
                         platform = Platform(platform_str)
                         adapter = self.adapters.get(platform)
@@ -13368,6 +13548,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             chat_type=chat_type,
                             reply_to_message_id=message_id,
                             adapter=adapter,
+                            scope_id=scope_id,
                         )
                         # Fallback session key if not stored (old pending files)
                         if not session_key:
@@ -13589,6 +13770,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             chat_type = pending.get("chat_type")
             thread_id = pending.get("thread_id")
             message_id = pending.get("message_id")
+            scope_id = pending.get("scope_id")
 
             if not exit_code_path.exists():
                 logger.info("Update notification deferred: update still running")
@@ -13635,6 +13817,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_type=chat_type,
                     reply_to_message_id=message_id,
                     adapter=adapter,
+                    scope_id=scope_id,
                 )
                 # Strip ANSI escape codes for clean display
                 output = re.sub(r'\x1b\[[0-9;]*m', '', output).strip()
@@ -13671,7 +13854,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return True
 
-    async def _send_restart_notification(self) -> Optional[tuple[str, str, Optional[str]]]:
+    async def _send_restart_notification(self) -> Optional[tuple]:
         """Notify the chat that initiated /restart that the gateway is back."""
         notify_path = _hermes_home / ".restart_notify.json"
         if not notify_path.exists():
@@ -13684,6 +13867,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             chat_type = data.get("chat_type")
             thread_id = data.get("thread_id")
             message_id = data.get("message_id")
+            scope_id = data.get("scope_id")
 
             if not platform_str or not chat_id:
                 return None
@@ -13712,6 +13896,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 chat_type=chat_type,
                 reply_to_message_id=message_id,
                 adapter=adapter,
+                scope_id=scope_id,
             )
             result = await adapter.send(
                 str(chat_id),
@@ -13736,7 +13921,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 platform_str,
                 chat_id,
             )
-            return str(platform_str), str(chat_id), str(thread_id) if thread_id else None
+            return _delivery_target_key(
+                platform_str,
+                chat_id,
+                thread_id,
+                scope_id,
+            )
         except Exception as e:
             logger.warning("Restart notification failed: %s", e)
             return None
@@ -13746,21 +13936,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _send_home_channel_startup_notifications(
         self,
         *,
-        skip_targets: Optional[set[tuple[str, str, Optional[str]]]] = None,
-    ) -> set[tuple[str, str, Optional[str]]]:
+        skip_targets: Optional[set[tuple]] = None,
+    ) -> set[tuple]:
         """Notify configured home channels that the gateway is back online.
 
         The notification is best-effort and sent once per connected platform
         home channel. ``skip_targets`` lets startup avoid duplicate messages
         when a more specific restart notification is queued for the same chat.
         """
-        delivered: set[tuple[str, str, Optional[str]]] = set()
+        delivered: set[tuple] = set()
         skipped = skip_targets or set()
         message = "♻️ Gateway online — Hermes is back and ready."
 
         for platform, adapter in self.adapters.items():
-            home = self.config.get_home_channel(platform)
-            if not home or not home.chat_id:
+            homes = _configured_home_channels(self.config, platform)
+            if not homes:
                 continue
 
             platform_cfg = self.config.platforms.get(platform)
@@ -13771,55 +13961,67 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 continue
 
-            target = (platform.value, str(home.chat_id), str(home.thread_id) if home.thread_id else None)
-            if target in skipped or target in delivered:
-                continue
-
-            try:
-                metadata = self._thread_metadata_for_target(
+            for home in homes:
+                target = _delivery_target_key(
                     platform,
                     home.chat_id,
                     home.thread_id,
-                    adapter=adapter,
+                    home.scope_id,
                 )
-                if metadata:
-                    result = await adapter.send(
-                        str(home.chat_id),
-                        message,
-                        metadata=_non_conversational_metadata(metadata, platform=platform),
+                if (
+                    _delivery_target_seen(target, skipped)
+                    or _delivery_target_seen(target, delivered)
+                ):
+                    continue
+
+                try:
+                    metadata = self._thread_metadata_for_target(
+                        platform,
+                        home.chat_id,
+                        home.thread_id,
+                        adapter=adapter,
+                        scope_id=home.scope_id,
                     )
-                else:
-                    _startup_meta = _non_conversational_metadata(platform=platform)
-                    if _startup_meta:
+                    if metadata:
                         result = await adapter.send(
                             str(home.chat_id),
                             message,
-                            metadata=_startup_meta,
+                            metadata=_non_conversational_metadata(
+                                metadata, platform=platform
+                            ),
                         )
                     else:
-                        result = await adapter.send(str(home.chat_id), message)
-                if result is not None and getattr(result, "success", True) is False:
+                        _startup_meta = _non_conversational_metadata(platform=platform)
+                        if _startup_meta:
+                            result = await adapter.send(
+                                str(home.chat_id),
+                                message,
+                                metadata=_startup_meta,
+                            )
+                        else:
+                            result = await adapter.send(str(home.chat_id), message)
+                    if result is not None and getattr(result, "success", True) is False:
+                        logger.warning(
+                            "Home-channel startup notification failed for %s:%s: %s",
+                            platform.value,
+                            home.chat_id,
+                            getattr(result, "error", "send returned success=False"),
+                        )
+                        continue
+
+                    delivered.add(target)
+                    logger.info(
+                        "Sent home-channel startup notification to %s:%s",
+                        platform.value,
+                        home.chat_id,
+                    )
+                except Exception as exc:
                     logger.warning(
                         "Home-channel startup notification failed for %s:%s: %s",
                         platform.value,
                         home.chat_id,
-                        getattr(result, "error", "send returned success=False"),
+                        exc,
                     )
-                    continue
-
-                delivered.add(target)
-                logger.info(
-                    "Sent home-channel startup notification to %s:%s",
-                    platform.value,
-                    home.chat_id,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Home-channel startup notification failed for %s:%s: %s",
-                    platform.value,
-                    home.chat_id,
-                    exc,
-                )
 
         return delivered
 
@@ -14858,6 +15060,68 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True
         generations = self.__dict__.get("_session_run_generation") or {}
         return int(generations.get(session_key, 0)) == int(generation)
+
+    async def _is_delivery_turn_current(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        run_generation: Optional[int],
+    ) -> bool:
+        """Revalidate local generation and adapter claim at delivery boundary.
+
+        Most platforms only need the in-process generation token. Durable
+        transports such as Queue may additionally expose ``is_active_turn``;
+        that hook verifies the DB ``active_turn_id`` so a worker whose TTL was
+        reclaimed cannot publish a late zombie response. Hook errors fail
+        closed because ownership uncertainty must never become a duplicate send.
+        """
+        if (
+            run_generation is not None
+            and session_key
+            and not self._is_session_run_current(session_key, run_generation)
+        ):
+            return False
+
+        adapter = self.adapters.get(event.source.platform)
+        verifier = getattr(type(adapter), "is_active_turn", None) if adapter else None
+        if callable(verifier):
+            try:
+                verdict = verifier(adapter, event)
+                if inspect.isawaitable(verdict):
+                    verdict = await verdict
+            except Exception as exc:
+                logger.error(
+                    "Delivery fence check failed for %s: %s",
+                    session_key or "?",
+                    exc,
+                )
+                return False
+            if not verdict:
+                return False
+
+        # The durable claim check above can await network/SQLite I/O. Recheck
+        # the local generation afterwards so /stop or /new cannot win that gap.
+        return (
+            run_generation is None
+            or not session_key
+            or self._is_session_run_current(session_key, run_generation)
+        )
+
+    def _discard_stale_delivery_callback(
+        self,
+        source: SessionSource,
+        session_key: str,
+        run_generation: Optional[int],
+    ) -> None:
+        """Drop only this stale turn's deferred post-delivery callback."""
+        adapter = self.adapters.get(source.platform)
+        if getattr(type(adapter), "pop_post_delivery_callback", None) is not None:
+            adapter.pop_post_delivery_callback(
+                session_key,
+                generation=run_generation,
+            )
+        elif adapter and hasattr(adapter, "_post_delivery_callbacks"):
+            adapter._post_delivery_callbacks.pop(session_key, None)
 
     def _bind_adapter_run_generation(
         self,

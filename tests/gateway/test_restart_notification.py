@@ -145,6 +145,22 @@ async def test_restart_command_preserves_thread_id(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_restart_command_preserves_workspace_scope(tmp_path, monkeypatch):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner, _adapter = make_restart_runner()
+    runner.request_restart = MagicMock(return_value=True)
+    source = make_restart_source(chat_id="C_SHARED")
+    source.platform = Platform.SLACK
+    source.scope_id = "T_APOM"
+    event = MessageEvent(text="/restart", source=source, message_id="m-scope")
+
+    await runner._handle_restart_command(event)
+
+    data = json.loads((tmp_path / ".restart_notify.json").read_text())
+    assert data["scope_id"] == "T_APOM"
+
+
+@pytest.mark.asyncio
 async def test_restart_command_uses_atomic_json_writes_for_marker_files(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
@@ -243,6 +259,30 @@ async def test_sethome_preserves_thread_target_for_same_process_restart(tmp_path
     assert home.thread_id == "topic-7"
 
 
+@pytest.mark.asyncio
+async def test_sethome_preserves_workspace_scope_for_same_process_restart(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    saved = {}
+    monkeypatch.setattr(
+        "hermes_cli.config.save_env_value",
+        lambda key, value: saved.__setitem__(key, value),
+    )
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(chat_id="C_APOM")
+    source.platform = Platform.SLACK
+    source.scope_id = "T_APOM"
+    source.chat_name = "APOM Ops"
+    event = MessageEvent(text="/sethome", source=source, message_id="m-home-scope")
+
+    await runner._handle_set_home_command(event)
+
+    home = runner.config.get_home_channel(Platform.SLACK)
+    assert saved["SLACK_HOME_CHANNEL_SCOPE_ID"] == "T_APOM"
+    assert home is not None and home.scope_id == "T_APOM"
+
+
 # ── home-channel startup notifications ─────────────────────────────────────
 
 
@@ -304,6 +344,66 @@ async def test_send_home_channel_startup_notification_preserves_thread_metadata(
             "direct_messages_topic_id": "777",
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_send_home_channel_startup_notification_preserves_workspace_scope(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.SLACK] = runner.config.platforms.pop(
+        Platform.TELEGRAM
+    )
+    runner.adapters = {Platform.SLACK: adapter}
+    runner.config.platforms[Platform.SLACK].home_channel = HomeChannel(
+        platform=Platform.SLACK,
+        chat_id="C_SHARED",
+        name="APOM Ops",
+        scope_id="T_APOM",
+    )
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="home"))
+
+    delivered = await runner._send_home_channel_startup_notifications(
+        # A same-ID home in another workspace must not suppress APOM.
+        skip_targets={("slack", "C_SHARED", None, "T_TEAM")},
+    )
+
+    assert delivered == {("slack", "C_SHARED", None, "T_APOM")}
+    adapter.send.assert_called_once_with(
+        "C_SHARED",
+        "♻️ Gateway online — Hermes is back and ready.",
+        metadata={"scope_id": "T_APOM"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_startup_notifies_every_configured_slack_workspace_home(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner, adapter = make_restart_runner()
+    slack_cfg = runner.config.platforms.pop(Platform.TELEGRAM)
+    slack_cfg.home_channel = None
+    slack_cfg.extra["workspace_home_channels"] = {
+        "T_TEAM": "C_TEAM",
+        "T_APOM": "C_APOM",
+    }
+    runner.config.platforms[Platform.SLACK] = slack_cfg
+    runner.adapters = {Platform.SLACK: adapter}
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="home"))
+
+    delivered = await runner._send_home_channel_startup_notifications()
+
+    assert delivered == {
+        ("slack", "C_TEAM", None, "T_TEAM"),
+        ("slack", "C_APOM", None, "T_APOM"),
+    }
+    assert [call.kwargs["metadata"] for call in adapter.send.await_args_list] == [
+        {"scope_id": "T_TEAM"},
+        {"scope_id": "T_APOM"},
+    ]
 
 
 @pytest.mark.asyncio
@@ -426,6 +526,34 @@ async def test_send_restart_notification_with_thread(tmp_path, monkeypatch):
         "telegram_reply_to_message_id": "m2",
     }
     assert not notify_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_send_restart_notification_preserves_workspace_scope(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(json.dumps({
+        "platform": "slack",
+        "chat_id": "C_SHARED",
+        "scope_id": "T_APOM",
+    }))
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.SLACK] = runner.config.platforms.pop(
+        Platform.TELEGRAM
+    )
+    runner.adapters = {Platform.SLACK: adapter}
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="sent"))
+
+    delivered = await runner._send_restart_notification()
+
+    assert delivered == ("slack", "C_SHARED", None, "T_APOM")
+    adapter.send.assert_awaited_once_with(
+        "C_SHARED",
+        "♻ Gateway restarted successfully. Your session continues.",
+        metadata={"scope_id": "T_APOM"},
+    )
 
 
 @pytest.mark.asyncio
