@@ -41,6 +41,7 @@ from gateway.platforms.base import (
     SendResult,
 )
 from gateway.config import Platform, PlatformConfig
+from gateway.conversation_closeout import mark_turn_active, mark_turn_closed
 from gateway.session_context import reset_conversation_context, set_conversation_context
 
 logger = logging.getLogger(__name__)
@@ -882,6 +883,16 @@ class QueueAdapter(BasePlatformAdapter):
             turn.conversation_id,
         )
         self._inflight[turn.event_id] = turn
+        # F4: 활성 턴 registry에 생존 선언 — queue_handoff 도구의 terminal
+        # defer 등록은 여기 마킹된 턴에만 허용된다(턴 종료 후 상속 ContextVar
+        # 스냅샷의 terminal 호출이 고아 등록이 되는 것을 구조적으로 차단).
+        # requester는 인바운드 sender — 활성 턴 안의 종결 대상 대조용.
+        mark_turn_active(
+            parent_event_id=turn.event_id,
+            conversation_id=turn.conversation_id,
+            requester=sender,
+            delivery_token=turn.active_delivery_token,
+        )
         event_token = _ACTIVE_QUEUE_EVENT_ID.set(turn.event_id)
         delivery_token = _ACTIVE_QUEUE_DELIVERY_TOKEN.set(
             turn.active_delivery_token
@@ -896,7 +907,10 @@ class QueueAdapter(BasePlatformAdapter):
         try:
             await self.handle_message(event)
         except BaseException:
+            # 동기 실패(스폰 전) — 완료훅이 오지 않으므로 활성 마킹·등록도
+            # 여기서 걷는다(reclaim 재처리 시 재활성화된다).
             self._inflight.pop(turn.event_id, None)
+            mark_turn_closed(turn.event_id, turn.active_delivery_token)
             raise
         finally:
             reset_conversation_context(conversation_tokens)
@@ -1085,6 +1099,40 @@ class QueueAdapter(BasePlatformAdapter):
         """GatewayRunner가 최종 응답 반환 직전에 호출하는 claim fence hook."""
         return await self._is_active_message_id(getattr(event, "message_id", None))
 
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        """턴 태스크 초입에서 태스크 컨텍스트를 이 턴의 claim 식별자로
+        재바인딩한다(F2 근본수리 — 턴별 컨텍스트 재바인딩).
+
+        코어의 pending drain 태스크는 직전 턴 태스크 안에서 create_task로
+        스폰돼 직전 턴의 ContextVar 스냅샷을 그대로 상속한다. 재바인딩이
+        없으면 후속 턴의 send()가 직전 턴의 stale 식별자로 fence에 걸려
+        (ownership lost) 최종 답이 유실되고 delivery가 error(비재claim)로
+        끝난다. 이 훅은 코어 _process_message_background의 첫 동작으로 —
+        첫 턴/drain 턴 구분 없이 — **해당 턴 태스크의 컨텍스트 안에서**
+        실행되므로, 여기서 set한 값이 턴 전체(에이전트 런 → send → 완료훅)에
+        적용된다. 첫 턴에서는 폴링 태스크에서 상속된 값과 같은 값을 다시
+        set하는 멱등 동작이다.
+
+        _inflight에 없는 event_id는 건드리지 않는다(no-touch) — 소유권을
+        잃은 턴은 상속된 stale 컨텍스트가 fence에 걸려 가시적 실패로 남는
+        기존 fail-visible 경로를 보존한다. 여기서 clear(set None)하면 v2
+        send가 '부모 턴 없음' no-op success로 강등돼 침묵 소실이 재발한다.
+
+        set_conversation_context의 반환 토큰은 버린다 — 이 바인딩은 중첩
+        스코프가 아니라 턴 태스크 수명이며, 태스크 종료와 함께 컨텍스트가
+        통째로 소멸하므로 reset이 필요 없다.
+        """
+        event_id = str(getattr(event, "message_id", "") or "")
+        if not event_id:
+            return
+        turn = self._inflight.get(event_id)
+        if turn is None:
+            return
+        _ACTIVE_QUEUE_EVENT_ID.set(event_id)
+        if isinstance(turn, _ConversationTurn):
+            _ACTIVE_QUEUE_DELIVERY_TOKEN.set(turn.active_delivery_token)
+            set_conversation_context(turn.conversation_id, turn.event_id)
+
     async def on_processing_complete(
         self, event: MessageEvent, outcome: ProcessingOutcome
     ) -> None:
@@ -1102,6 +1150,12 @@ class QueueAdapter(BasePlatformAdapter):
             # transaction에서 검증한다. 실패한 stale worker는 상태를 쓰지 못하고,
             # accepted row는 만료 뒤 새 worker가 재claim한다.
             self._inflight.pop(event_id, None)
+            # F4: 활성 해제 + 등록 소비를 한 락 안에서 원자화 — 처리 결과와
+            # 무관하게 여기서 턴을 닫는다. 이 시점 이후의 terminal 호출(상속
+            # 스냅샷)은 register가 거부해 즉시-append로 폴스루하므로 고아
+            # 등록이 없고, stale 워커(재claim 후 옛 token)의 늦은 close는
+            # token 대조로 새 턴의 상태를 건드리지 못한다.
+            deferred = mark_turn_closed(turn.event_id, turn.active_delivery_token)
             next_state = (
                 "completed"
                 if outcome is ProcessingOutcome.SUCCESS
@@ -1113,28 +1167,81 @@ class QueueAdapter(BasePlatformAdapter):
                     expected_state="accepted",
                     next_state=next_state,
                 )
-                # F2(의도적으로 ContextVar를 여기서 clear하지 않는다): 이 훅은
-                # 코어가 스폰한 백그라운드 태스크(A) 안에서 실행된다. 같은
-                # 대화의 후속 턴(B)이 core의 _pending_messages로 큐잉돼 있으면,
-                # B를 처리하는 drain task는 스폰 시점에 A의 이 태스크 컨텍스트를
-                # 그대로 상속한다(ContextVar는 Task 생성 시점 스냅샷). 여기서
-                # _ACTIVE_QUEUE_EVENT_ID/_ACTIVE_QUEUE_DELIVERY_TOKEN을
-                # set(None)하면 drain task도 그 None을 상속하고, B가 보낼 최종
-                # 응답의 send()는 "부모 턴 없음"으로 오인해 조용한 success
-                # no-op이 된다 — B의 답이 delivery는 completed인데 내용만
-                # 통째로 소실되는 침묵 실패(관측 불가)다.
-                # clear를 생략하면 drain task는 대신 A의 (이미 _inflight에서
-                # pop된) stale event_id/token을 그대로 들고 있어, B의 send()
-                # fence(_is_active_message_id → _inflight 조회 실패)가 명시적으로
-                # 걸려 SendResult(success=False, "ownership lost")가 되고 B의
-                # delivery도 error로 가시화된다 — 침묵 소실보다 에러 가시화가
-                # 낫다는 최소 수리다. 근본 수리(턴별 컨텍스트 재바인딩)는 P2.
+                # F2(여전히 ContextVar를 여기서 clear하지 않는다): 근본 수리는
+                # on_processing_start의 턴별 재바인딩이다 — 후속 drain 턴은
+                # 자기 태스크 초입에서 자기 claim 식별자로 재바인딩되므로 이
+                # 훅이 남긴 값에 의존하지 않는다. 그래도 clear(set None)는
+                # 금지다: 재바인딩이 no-touch로 빠지는 소유권 상실 턴에서
+                # None이 상속되면 v2 send가 "부모 턴 없음" no-op success로
+                # 강등돼 침묵 소실이 재발한다. stale 값이 남아야
+                # fence(ownership lost)로 가시화된다 — fail-visible 백스톱.
             except Exception as exc:
                 logger.warning(
                     "[Queue] Conversation completion fenced "
                     "(event=%s, state=%s): %s",
                     event_id,
                     next_state,
+                    exc,
+                )
+                # 소유권/lease fence에 걸린 stale worker는 종결(terminal)도
+                # 쓰지 않는다 — 새 owner의 재처리 턴이 다시 판단한다.
+                return
+            if deferred is None:
+                return
+            if outcome is not ProcessingOutcome.SUCCESS:
+                # 답이 나가지 못한 턴의 종결 의도는 폐기한다 — 등록만으로
+                # 대화를 닫으면 "실제로 안 끝났는데 ✅"(거짓 종결)가 된다.
+                # delivery가 error로 가시화됐으므로 재처리 턴이 다시 낸다.
+                logger.warning(
+                    "[Queue] Discarding deferred terminal for %s turn "
+                    "(event=%s, type=%s)",
+                    outcome.value,
+                    event_id,
+                    deferred.event_type,
+                )
+                return
+            if deferred.conversation_id != turn.conversation_id:
+                # 다른 대화의 종결 의도가 이 턴으로 새는 오염 방어.
+                logger.warning(
+                    "[Queue] Discarding deferred terminal with mismatched "
+                    "conversation (event=%s, registered=%s, turn=%s)",
+                    event_id,
+                    deferred.conversation_id,
+                    turn.conversation_id,
+                )
+                return
+            # §5 순서의 기계적 보장: 코어는 최종 답(reply) 발신을 마친 뒤에야
+            # 이 훅을 부르므로, 여기서의 terminal append는 구조적으로 항상
+            # reply 뒤다. idempotency_key는 인바운드 event_id에서 파생돼
+            # 재시도에도 안정적이고, _build_producer_event가 created_at을
+            # 인바운드에서 승계해 byte-stable(서버 dedupe 전제)이다.
+            terminal_event = self._build_producer_event(
+                turn,
+                event_type=deferred.event_type,
+                body=deferred.body or deferred.event_type,
+                idempotency_key=f"queue_close:{self._agent}:{turn.event_id}",
+            )
+            try:
+                receipt = await self._conversation_call(
+                    "append_event", {"event": terminal_event}
+                )
+                if (
+                    not isinstance(receipt, Mapping)
+                    or receipt.get("event_id") != terminal_event["event_id"]
+                ):
+                    raise RuntimeError(
+                        "deferred terminal receipt event identity mismatch"
+                    )
+            except Exception as exc:  # noqa: BLE001 — 훅 밖으로 예외 전파 금지
+                # reply까지는 이미 진실이므로 delivery(completed)는 되돌리지
+                # 않는다. terminal만 유실된 대화는 닫히지 않은 채 남는데,
+                # 이는 계약 철학("성급히 종결하지 마라")상 가시적 안전측이다
+                # — 요청자 종결/다음 턴 종결이 폴백으로 남는다.
+                logger.warning(
+                    "[Queue] Deferred terminal append failed "
+                    "(event=%s, type=%s): %s",
+                    event_id,
+                    deferred.event_type,
                     exc,
                 )
             return

@@ -26,14 +26,22 @@ slack_user_id=<발신 에이전트 키>로 박히고,
 발신 키를 넣거나 QUEUE_ALLOW_ALL_USERS를 켜지 않으면 handoff가 "sender not allowed"로
 error 마킹돼 소실된다 — 이 도구가 success를 반환해도 그렇다(인가 우회는 별도 이슈).
 
-⚠️ F4(순서 제약, 문서화만 — 동작 변경 없음): terminal event_type
-(completed/failed/no_action)은 인바운드 conversation.v1 턴이 아직 진행 중일 때
-(= 최종 답을 보내기 전에) 호출하면 안 된다. 게이트웨이는 턴이 끝난 뒤 모델의
-최종 답을 자동으로 ``reply`` canonical event로 append하는데, ledger는 이미
-terminal(DONE)로 닫힌 conversation에 append를 거부한다 — 즉 턴 도중
-completed/failed/no_action을 먼저 호출하면 정상적인 게이트웨이 auto-reply가
-delivery error를 만든다. 종결은 요청자 쪽에서 걸거나, 더 이상 답을 만들지 않는
-턴에서 호출해야 한다(종결 메커니즘 재설계는 P2).
+F4 deferred-terminal(§5 순서의 기계적 보장): terminal event_type
+(completed/failed/no_action)을 **활성 인바운드 conversation.v1 턴 안에서**
+호출하면 즉시 append하지 않고 ``gateway.conversation_closeout``에 등록만
+한다(반환 ``deferred=true``). 게이트웨이는 턴이 끝날 때 모델의 최종 답을 자동
+``reply``로 append하는데, ledger는 terminal 뒤 append를 전면 거부하므로 즉시
+append하면 자기 최종 답이 delivery error가 된다 — 등록된 terminal은 큐 어댑터
+``on_processing_complete``가 reply 발신 뒤 append해 reply → terminal 순서를
+구조적으로 보장한다. FAILURE/CANCELLED 턴의 등록은 폐기된다(거짓 종결 방지).
+
+"활성 턴" 판정 권위는 ContextVar 존재가 아니라 어댑터가 dispatch 때 마킹하는
+**활성 턴 registry**다 — 스냅샷은 턴 종료 후에도 상속처(delegate background
+워커 등)에 남아, 존재만으로 defer하면 아무 완료훅도 pop하지 않는 고아 등록
+(성공 반환 동반 침묵 소실)이 된다. registry에 없으면 기존대로 즉시 append
+(요청자 종결·턴 밖 종결과 동일 의미론). 활성 턴 안의 terminal은 그 턴의
+요청자(to == requester)에게만 허용된다 — 어댑터가 append하는 terminal의
+대상이 인바운드 sender로 고정되기 때문(다른 handoff 종결은 턴 밖에서).
 """
 
 import asyncio
@@ -49,6 +57,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping
 
+from gateway.conversation_closeout import (
+    TERMINAL_EVENT_TYPES,
+    active_turn,
+    register_deferred_terminal,
+)
 from tools.registry import registry, tool_error, tool_result
 from tools.queue_handoff_receipts import (
     QueueHandoffReceiptStore,
@@ -735,6 +748,58 @@ async def queue_handoff_tool(args: dict, **kw) -> str:
             parent_event_id = (
                 get_session_env("HERMES_SESSION_CONVERSATION_EVENT_ID", "") or None
             )
+            if (
+                event_type in TERMINAL_EVENT_TYPES
+                and parent_conversation_id
+                and parent_event_id
+            ):
+                # F4 deferred-terminal: 활성 인바운드 v2 턴 안의 terminal은
+                # 즉시 append하면 턴 끝의 auto-reply가 terminal 뒤 append로
+                # 거부된다(§5). 등록만 하고, 큐 어댑터 on_processing_complete가
+                # reply 발신 뒤 append해 reply → terminal 순서를 보장한다.
+                # 위의 방어(roster·self·길이 검증)를 전부 통과한 뒤에만 온다.
+                #
+                # ★ContextVar/env 존재만으로 "활성 턴"을 판정하면 안 된다 —
+                # 스냅샷은 턴 종료 후에도 상속처(delegate background 워커 등)에
+                # 남아, 고아 등록(pop 주체 없음 + success 반환 = 침묵 소실)이
+                # 된다. 판정 권위는 어댑터가 dispatch 때 마킹하는 활성 턴
+                # registry이고, 최종 판정은 register 내부(같은 락)에서 한 번 더
+                # 이뤄진다 — None이면 턴이 방금 닫힌 것이므로 기존 즉시-append
+                # 경로로 폴스루한다(턴 밖 terminal과 동일 의미론).
+                turn = active_turn(parent_event_id)
+                if turn is not None and turn.conversation_id == parent_conversation_id:
+                    if turn.requester and to != turn.requester:
+                        # 어댑터가 append하는 terminal의 대상은 인바운드
+                        # sender로 고정된다 — 다른 to를 defer로 받으면 그
+                        # 요청자 앞으로 조용히 현재 대화를 닫는 오발이 된다.
+                        return tool_error(
+                            "terminal during an active inbound turn can only "
+                            f"close toward its requester '{turn.requester}' — "
+                            f"got to='{to}'. To close a different handoff, "
+                            "call this outside the active turn."
+                        )
+                    record = register_deferred_terminal(
+                        conversation_id=parent_conversation_id,
+                        parent_event_id=parent_event_id,
+                        event_type=event_type,
+                        body=message,
+                    )
+                    if record is not None:
+                        return tool_result(
+                            success=True,
+                            deferred=True,
+                            target=to,
+                            event_type=event_type,
+                            conversation_id=parent_conversation_id,
+                            protocol_version=_CONVERSATION_PROTOCOL,
+                            note=(
+                                "terminal registered for deferred append: the "
+                                "gateway will append it to this conversation "
+                                "(addressed to its requester) right after your "
+                                "final reply, preserving the reply -> terminal "
+                                "order. It is discarded if this turn fails."
+                            ),
+                        )
             candidate_event = _build_conversation_event(
                 request=request,
                 idempotency_key=idempotency_key,
@@ -893,14 +958,18 @@ QUEUE_HANDOFF_SCHEMA = {
                     "automatically by the gateway for inline answers and is not "
                     "exposed here. conversation.v1 only; legacy queue.v1 has no "
                     "canonical event vocabulary and rejects this field instead of "
-                    "silently ignoring it. IMPORTANT ordering constraint: terminal "
-                    "events (completed/failed/no_action) must not be sent during an "
-                    "active inbound conversation turn before your final answer — the "
-                    "gateway auto-appends your final answer as a `reply` event AFTER "
-                    "the turn, and the ledger rejects appends to an already-terminal "
-                    "conversation. Close from the requester side instead, or only use "
-                    "a terminal event_type in a turn where you produce no further "
-                    "answer."
+                    "silently ignoring it. Ordering (deferred terminal): when you "
+                    "call a terminal event_type during an active inbound "
+                    "conversation turn, it is NOT appended immediately — the tool "
+                    "returns deferred=true and the gateway appends the terminal "
+                    "right after your final reply, preserving the required "
+                    "reply -> terminal order. Pass the closing reason as message. "
+                    "During an active turn, to must be that turn's requester "
+                    "(closing a different handoff requires calling outside the "
+                    "active turn). If this turn fails, the deferred terminal is "
+                    "discarded (the conversation stays open). Outside an active "
+                    "inbound turn (e.g. closing a handoff you initiated earlier), "
+                    "the terminal is appended immediately as before."
                 ),
             },
         },

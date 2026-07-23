@@ -775,6 +775,154 @@ class TestConversationV1Receipts(QueueHandoffToolTestBase):
         self.assertTrue(completed["completed"])
 
 
+class TestConversationV1DeferredTerminal(QueueHandoffToolTestBase):
+    """F4 deferred-terminal: 활성 v2 인바운드 턴 안의 terminal은 즉시 append
+    대신 gateway.conversation_closeout에 등록만 한다 — 게이트웨이 auto-reply가
+    턴 끝에 나가므로, 즉시 append하면 §5(terminal 뒤 append 전면 거부)에 걸려
+    자기 최종 답이 delivery error가 된다. 어댑터가 reply 발신 뒤 pop해
+    append함으로써 reply → terminal 순서를 기계적으로 보장한다."""
+
+    V2_ENV = {
+        "QUEUE_PROTOCOL_VERSION": "conversation.v1",
+        "QUEUE_ENDPOINT": "http://127.0.0.1:8770",
+        "QUEUE_CONVERSATION_CREDENTIAL": "private-agent-credential",
+    }
+    # 큐 어댑터 _dispatch_conversation_turn이 싣는 인바운드 턴 컨텍스트를
+    # os.environ 폴백 경로로 재현한다(get_session_env 계약).
+    ACTIVE_TURN_ENV = {
+        "HERMES_SESSION_CONVERSATION_ID": "conv_queue_example_001",
+        "HERMES_SESSION_CONVERSATION_EVENT_ID": "evt_queue_example_001",
+    }
+
+    @staticmethod
+    def _fake_append(*args, **kwargs):
+        return {
+            "receipt": "enqueued",
+            "event_id": kwargs["event"]["event_id"],
+            "delivery_status": "pending",
+            "inserted": True,
+        }
+
+    def _mark_active(self, *, requester="chadol", token="tok-tool-test"):
+        """큐 어댑터 dispatch가 하는 활성 턴 마킹을 재현하고 teardown을 예약."""
+        from gateway.conversation_closeout import mark_turn_active, mark_turn_closed
+
+        mark_turn_active(
+            parent_event_id="evt_queue_example_001",
+            conversation_id="conv_queue_example_001",
+            requester=requester,
+            delivery_token=token,
+        )
+        self.addCleanup(mark_turn_closed, "evt_queue_example_001", token)
+
+    def test_terminal_in_active_v2_turn_defers_without_append(self):
+        from gateway.conversation_closeout import pop_deferred_terminal
+
+        self._mark_active()
+        with patch.dict(
+            os.environ, {**self.V2_ENV, **self.ACTIVE_TURN_ENV}, clear=False
+        ), patch("tools.queue_handoff_tool._do_conversation_append") as do_append:
+            result = self.call_tool(
+                to="chadol", message="확인 끝 — 종결한다", event_type="completed"
+            )
+
+        do_append.assert_not_called()
+        self.assertTrue(result.get("success"), result)
+        self.assertTrue(result.get("deferred"), result)
+        self.assertEqual(result["event_type"], "completed")
+        self.assertEqual(result["conversation_id"], "conv_queue_example_001")
+
+        record = pop_deferred_terminal("evt_queue_example_001")
+        self.assertIsNotNone(record)
+        self.assertEqual(record.conversation_id, "conv_queue_example_001")
+        self.assertEqual(record.event_type, "completed")
+        self.assertEqual(record.body, "확인 끝 — 종결한다")
+
+    def test_terminal_with_inherited_context_after_turn_close_appends_immediately(self):
+        """SPEC-1 회귀 가드: ContextVar/env 스냅샷은 턴 종료 후에도 상속처
+        (백그라운드 delegate 워커 등)에 남는다 — 활성 턴 registry에 없으면
+        defer하지 않고 기존대로 즉시 append해야 한다. defer로 빠지면 아무
+        완료훅도 pop하지 않는 고아 등록(성공 보고 동반 침묵 소실)이 된다."""
+        from gateway.conversation_closeout import pop_deferred_terminal
+
+        # 활성 마킹 없음 = 턴이 이미 닫혔거나 이 프로세스의 턴이 아님.
+        with patch.dict(
+            os.environ, {**self.V2_ENV, **self.ACTIVE_TURN_ENV}, clear=False
+        ), patch(
+            "tools.queue_handoff_tool._do_conversation_append",
+            side_effect=self._fake_append,
+        ) as do_append:
+            result = self.call_tool(
+                to="chadol", message="배치 완료 — 종결", event_type="completed"
+            )
+
+        do_append.assert_called_once()
+        self.assertTrue(result.get("success"), result)
+        self.assertFalse(result.get("deferred", False))
+        self.assertIsNone(pop_deferred_terminal("evt_queue_example_001"))
+        # 즉시 append된 event는 부모 conversation을 승계한 terminal이다.
+        appended = do_append.call_args.kwargs["event"]
+        self.assertEqual(appended["event_type"], "completed")
+        self.assertEqual(appended["conversation_id"], "conv_queue_example_001")
+
+    def test_terminal_to_non_requester_in_active_turn_rejected(self):
+        """SPEC-3: 활성 인바운드 턴 안의 terminal은 그 턴의 요청자에게만 —
+        어댑터가 append하는 terminal event의 대상은 인바운드 sender로 고정되기
+        때문에, to가 다른 피어면 조용히 현재 대화를 닫는 오발이 된다. 등록
+        없이 명시 거부해 오용을 가시화한다(다른 handoff 종결은 턴 밖에서)."""
+        from gateway.conversation_closeout import pop_deferred_terminal
+
+        self._mark_active(requester="chadol")
+        with patch.dict(
+            os.environ, {**self.V2_ENV, **self.ACTIVE_TURN_ENV}, clear=False
+        ), patch("tools.queue_handoff_tool._do_conversation_append") as do_append:
+            result = self.call_tool(
+                to="smith", message="엉뚱한 대상 종결", event_type="completed"
+            )
+
+        do_append.assert_not_called()
+        self.assertIn("error", result)
+        self.assertIn("chadol", result["error"])
+        self.assertIsNone(pop_deferred_terminal("evt_queue_example_001"))
+
+    def test_non_terminal_in_active_v2_turn_still_appends_immediately(self):
+        """progress/question은 defer 대상이 아니다 — 기존 즉시 append 유지
+        (defer 과잉 확대 방지 가드)."""
+        from gateway.conversation_closeout import pop_deferred_terminal
+
+        self._mark_active()
+        with patch.dict(
+            os.environ, {**self.V2_ENV, **self.ACTIVE_TURN_ENV}, clear=False
+        ), patch(
+            "tools.queue_handoff_tool._do_conversation_append",
+            side_effect=self._fake_append,
+        ) as do_append:
+            result = self.call_tool(
+                to="chadol", message="진행 중이야", event_type="progress"
+            )
+
+        do_append.assert_called_once()
+        self.assertTrue(result.get("success"), result)
+        self.assertFalse(result.get("deferred", False))
+        self.assertIsNone(pop_deferred_terminal("evt_queue_example_001"))
+
+    def test_terminal_outside_active_turn_appends_immediately(self):
+        """활성 인바운드 턴 밖(요청자 종결 등)의 terminal은 기존대로 즉시
+        append한다 — deferred는 '같은 턴 auto-reply와의 순서 충돌'이 있는
+        경우에만 필요하다."""
+        with patch.dict(os.environ, self.V2_ENV, clear=False), patch(
+            "tools.queue_handoff_tool._do_conversation_append",
+            side_effect=self._fake_append,
+        ) as do_append:
+            result = self.call_tool(
+                to="chadol", message="이전 handoff 종결", event_type="completed"
+            )
+
+        do_append.assert_called_once()
+        self.assertTrue(result.get("success"), result)
+        self.assertFalse(result.get("deferred", False))
+
+
 class TestReceiptStoreConcurrency(QueueHandoffToolTestBase):
     def test_same_key_concurrent_reserve_selects_one_durable_event(self):
         from tools.queue_handoff_receipts import QueueHandoffReceiptStore
@@ -1012,22 +1160,22 @@ class TestCanonicalEventContract(QueueHandoffToolTestBase):
             {"request", "progress", "question", "completed", "failed", "no_action"},
         )
 
-    # --- F4: terminal event_type 순서 제약이 스키마 설명에 문서화돼 있어야 한다 ---
+    # --- F4: deferred-terminal 의미론이 스키마 설명에 문서화돼 있어야 한다 ---
 
-    def test_schema_event_type_description_documents_terminal_ordering_constraint(self):
-        """인바운드 턴 중 completed/failed/no_action을 먼저 호출하면 게이트웨이의
-        턴-후 auto-reply가 'already terminal'로 거부된다 — 이 순서 제약이 도구
-        설명에 명문화돼 있어야 에이전트가 실수로 자기 턴의 답을 delivery error로
-        만들지 않는다(Phase C 범위: 문서화만, 동작 변경 없음)."""
+    def test_schema_event_type_description_documents_deferred_terminal(self):
+        """활성 인바운드 턴 중의 terminal은 즉시 append되지 않고 deferred로
+        등록돼 최종 reply 뒤에 append된다(#45 F4) — 이 의미론이 도구 설명에
+        명문화돼 있어야 에이전트가 deferred=true 반환과 reply → terminal
+        순서 보장을 올바르게 이해한다."""
         from tools.queue_handoff_tool import QUEUE_HANDOFF_SCHEMA
 
         description = QUEUE_HANDOFF_SCHEMA["parameters"]["properties"]["event_type"][
             "description"
         ]
         self.assertIn("terminal", description.lower())
-        self.assertIn("before your final answer", description)
-        self.assertIn("reply", description)
-        self.assertIn("AFTER", description)
+        self.assertIn("deferred=true", description)
+        self.assertIn("reply -> terminal", description)
+        self.assertIn("discarded", description)
 
     # --- C2: idempotency — event_type만 다르면 키도 달라져야 하되, request는
     # 명시/미지정 상관없이 기존 해시와 하위호환(구버전 재시도와 계속 일치)돼야 한다.

@@ -246,7 +246,12 @@ def set_conversation_context(conversation_id: str, event_id: str) -> list:
     set해둔 값)으로 복원되고, 동시에 여러 턴이 겹쳐도 서로의 컨텍스트를
     덮어쓰지 않는다.
 
-    반환된 토큰 리스트는 ``reset_conversation_context``에 그대로 넘겨야 한다.
+    사용 패턴은 둘이다: ① 중첩 스코프 바인딩 — 반환 토큰을
+    ``reset_conversation_context``에 넘겨 스코프 종료 시 복원한다(폴링
+    태스크처럼 오래 사는 컨텍스트). ② 턴 태스크 수명 바인딩 — 큐 어댑터의
+    ``on_processing_start``처럼 턴 태스크 초입에서 재바인딩할 때는 토큰을
+    버려도 된다: 그 컨텍스트는 태스크 종료와 함께 통째로 소멸하므로 reset이
+    필요 없다.
     """
     return [
         _SESSION_CONVERSATION_ID.set(conversation_id),

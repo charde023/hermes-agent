@@ -12,6 +12,7 @@ Slack 멀티 워크스페이스와 Agent Directory 기반 `conversation.v1` 큐 
 | 세션·응답 범위 보존 | `gateway/session.py`, `gateway/platforms/base.py` | `tests/gateway/test_session.py`, `tests/gateway/test_platform_base.py` |
 | 큐 수신·lease fencing | `plugins/platforms/queue/adapter.py` | `tests/gateway/test_queue_adapter.py` |
 | 봇 간 handoff·receipt | `tools/queue_handoff_tool.py`, `tools/queue_handoff_receipts.py` | `tests/gateway/test_queue_handoff_tool.py` |
+| deferred terminal 등록소·활성 턴 registry | `gateway/conversation_closeout.py` | `tests/gateway/test_conversation_closeout.py` |
 | 시작·종료·인계 보고 | `gateway/run.py`, `gateway/config.py` | `tests/gateway/test_restart_notification.py`, `tests/gateway/test_gateway_shutdown.py` |
 
 ## 흐름
@@ -41,8 +42,9 @@ hermes가 canonical event를 생산한다 — 계약 SSOT는 slack_agent `design
 - **conversation_id는 방향 무관**(thread 해시)이고, 답신 handoff는 `HERMES_SESSION_CONVERSATION_ID`/`_EVENT_ID` ContextVar(세션 컨텍스트 통로)로 **부모를 승계**한다.
 - **producer event는 byte-stable이 계약**: `created_at`을 인바운드 event에서 승계 — 서버 dedupe가 payload_hash 일치를 요구해, 재빌드가 1바이트라도 다르면 idempotency collision→영구 error가 된다.
 - **producer 노이즈 게이트는 첫줄 prefix만**(`_is_producer_noise`). bridge `is_system_noise`(substring-anywhere)는 표시측 전용 — producer에서 쓰면 진짜 답변이 event째 소멸한다.
-- **같은 턴에서 명시 terminal(completed 등) 금지**: auto-reply가 턴 끝에 발화하므로 terminal 뒤 append 거부에 걸린다(도구 스키마에 명문화). 요청자 종결이 현행 패턴, 종결 메커니즘 재설계는 P2.
-- **drain(follow-up) 턴은 fail-visible**: v2 완료훅은 ContextVar를 클리어하지 않는다 — 클리어하면 후속 턴 답변이 조용히 소실된다(침묵 대신 ownership-lost 에러 가시화). 턴별 컨텍스트 재바인딩은 P2.
+- **같은 턴 terminal = deferred(F4, #45)**: 활성 인바운드 턴 안의 도구 terminal(completed/failed/no_action)은 즉시 append하지 않고 `gateway/conversation_closeout.py`에 등록만 한다(도구 반환 `deferred=true`) — 어댑터 `on_processing_complete`가 SUCCESS 시 reply 발신 뒤 append해 §5 순서(reply→terminal)를 기계 보장(안정 키 `queue_close:{agent}:{parent_event_id}`·created_at 승계 byte-stable). FAILURE/CANCELLED·advance fence·conversation 불일치는 폐기. ★"활성 턴" 판정 권위는 ContextVar 존재가 아니라 **활성 턴 registry**(dispatch가 `mark_turn_active`, 훅이 `mark_turn_closed`로 원자 소비)다 — 스냅샷은 턴 종료 후에도 상속처(delegate background 워커)에 남아, 존재만으로 defer하면 고아 등록(성공 반환 동반 침묵 소실)이 된다. 활성 턴 안 terminal은 그 턴의 요청자(to==requester)에게만 — 다른 handoff 종결은 턴 밖에서(즉시 append). 잔여 창: advance(completed) 성공 직후(또는 응답만 유실) terminal append 전 크래시/파티션이면 delivery가 completed라 재claim이 없어 그 턴의 종결 의도만 소실 — 대화는 열린 채 가시적으로 남고 요청자측/후속 턴 종결이 폴백(§5 "성급 종결 금지" 철학상 안전측).
+- **턴별 컨텍스트 재바인딩(F2, #45) — drain 턴도 자기 식별자로 답한다**: 코어 pending drain 태스크는 직전 턴 태스크의 ContextVar 스냅샷을 상속하므로, `QueueAdapter.on_processing_start`(코어 lifecycle hook — 모든 턴 태스크 초입·태스크 컨텍스트 안에서 실행)가 `event.message_id→_inflight` 조회로 재바인딩한다(v2: event_id·delivery token·conversation ctx 3종 / v1: event_id만). 코어 base.py 수정 0. ★완료훅의 ContextVar 클리어는 여전히 금지: 재바인딩이 no-touch로 빠지는 소유권 상실 턴(_inflight 미존재)에서 None이 상속되면 v2 send가 "부모 턴 없음" no-op success로 강등돼 침묵 소실이 재발한다 — stale 값이 남아야 ownership-lost로 가시화(fail-visible 백스톱).
+- **★병합-흡수 claim 잔여(미해소, #21 전 선행 검토)**: 같은 대화 후속 턴 2건 이상이 한 턴 처리 중 도착하면 코어 `merge_pending_message_event`가 TEXT 병합(message_id는 첫 건 유지)해 흡수된 건의 claim이 고아가 된다 — 병합 답으로 내용은 답변되지만 그 delivery는 accepted 정체 후 lease 만료(CLAIM_TTL 1800s) 재claim·재처리돼 같은 대화에 중복 답변 가능. F2 이전엔 같은 조건에서 병합 턴 답이 통째로 유실(error·비재claim)됐으므로 유실→중복으로 완화된 상태다. 근본 수리는 대화별 직렬화(어댑터 로컬 FIFO 또는 서버 claim 계약) 설계 과제.
 - **v2 전환 스위치** = 프로필 `.env` 3키(`QUEUE_PROTOCOL_VERSION`·`QUEUE_ENDPOINT`·`QUEUE_CONVERSATION_CREDENTIAL`) + `launchctl kickstart -k`(plist 무수정·bootout 불필요). ⚠️전환 즉시 옛 pending delivery를 claim하므로 **전환 전 stale delivery drain 필수**.
 
 ## ★ 음성지식·함정

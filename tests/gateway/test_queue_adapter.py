@@ -1764,6 +1764,426 @@ class TestConversationV1Adapter(QueueAdapterTestBase):
 
         self.assertEqual(self.append_event_types(adapter), ["ack", "reply"])
 
+    # ---- F2 근본수리: 턴별 컨텍스트 재바인딩(on_processing_start) -----------
+
+    def make_second_event(self):
+        """같은 대화(fixture conversation)의 후속 턴 canonical event."""
+        canonical, _directory = _conversation_fixture()
+        event = copy.deepcopy(canonical)
+        event["event_id"] = "evt_queue_example_002"
+        event["idempotency_key"] = "queue:evt_queue_example_002"
+        event["source_event_id"] = "queue:evt_queue_example_002"
+        event["body"] = "후속 질문이야"
+        event["summary"] = "차돌이 차미에게 후속 질문을 보냄"
+        return event
+
+    def make_inflight_turn(self, adapter, event, *, token):
+        from plugins.platforms.queue.adapter import _ConversationTurn
+
+        turn = _ConversationTurn(
+            event=event,
+            event_id=event["event_id"],
+            conversation_id=event["conversation_id"],
+            target_agent_id="chami",
+            worker=adapter._worker,
+            active_delivery_token=token,
+            lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=600),
+        )
+        adapter._inflight[turn.event_id] = turn
+        return turn
+
+    def make_turn_message(self, adapter, turn):
+        from gateway.platforms.base import MessageEvent
+
+        return MessageEvent(
+            text=str(turn.event["body"]),
+            source=adapter.build_source(
+                chat_id="queue:no-reply",
+                chat_name=f"queue:{turn.conversation_id}",
+                chat_type="channel",
+                user_id="chadol",
+                user_name="chadol",
+                thread_id=turn.conversation_id,
+            ),
+            message_id=turn.event_id,
+            internal=True,
+            metadata={"conversation_id": turn.conversation_id},
+        )
+
+    def test_on_processing_start_rebinds_context_to_inflight_turn(self):
+        """F2 근본수리: 코어의 pending drain 태스크는 직전 턴 태스크 안에서
+        스폰돼 직전 턴의 ContextVar 스냅샷을 그대로 상속한다. 턴 태스크 초입
+        훅(on_processing_start)이 event.message_id로 _inflight를 조회해 이
+        턴의 claim 식별자(event_id·delivery token·conversation ctx)로
+        재바인딩해야, 후속 턴의 send가 stale fence에 걸려 답이 유실되지
+        않는다."""
+        from gateway.session_context import get_session_env, set_conversation_context
+        from plugins.platforms.queue.adapter import (
+            _ACTIVE_QUEUE_DELIVERY_TOKEN,
+            _ACTIVE_QUEUE_EVENT_ID,
+        )
+
+        claim_a = self.make_claim()
+        adapter = self.make_v2_adapter(claim_a)
+        turn_b = self.make_inflight_turn(
+            adapter, self.make_second_event(), token="delivery-token-2"
+        )
+        message_b = self.make_turn_message(adapter, turn_b)
+        seen = {}
+
+        async def scenario():
+            # drain 상속 조건 재현 — 직전 턴 A의 stale 식별자가 그대로 남아있다.
+            _ACTIVE_QUEUE_EVENT_ID.set(claim_a["event_id"])
+            _ACTIVE_QUEUE_DELIVERY_TOKEN.set("delivery-token-1")
+            set_conversation_context("conv_stale_previous", claim_a["event_id"])
+            await adapter.on_processing_start(message_b)
+            seen["event_id"] = _ACTIVE_QUEUE_EVENT_ID.get()
+            seen["token"] = _ACTIVE_QUEUE_DELIVERY_TOKEN.get()
+            seen["conversation_id"] = get_session_env("HERMES_SESSION_CONVERSATION_ID")
+            seen["conversation_event_id"] = get_session_env(
+                "HERMES_SESSION_CONVERSATION_EVENT_ID"
+            )
+
+        asyncio.run(scenario())
+
+        self.assertEqual(seen["event_id"], turn_b.event_id)
+        self.assertEqual(seen["token"], "delivery-token-2")
+        self.assertEqual(seen["conversation_id"], turn_b.conversation_id)
+        self.assertEqual(seen["conversation_event_id"], turn_b.event_id)
+
+    def test_on_processing_start_leaves_context_when_turn_not_inflight(self):
+        """_inflight에 없는 턴(reclaim 등으로 소유권을 잃은 경우)은 재바인딩하지
+        않는다 — 상속된 stale 식별자가 send fence에 걸려 ownership-lost로
+        가시화되는 기존 fail-visible 경로를 보존한다. 여기서 clear(set None)
+        해버리면 send가 '부모 턴 없음' no-op success로 강등돼 침묵 소실이
+        재발한다."""
+        from gateway.session_context import get_session_env, set_conversation_context
+        from plugins.platforms.queue.adapter import (
+            _ACTIVE_QUEUE_DELIVERY_TOKEN,
+            _ACTIVE_QUEUE_EVENT_ID,
+        )
+
+        claim_a = self.make_claim()
+        adapter = self.make_v2_adapter(claim_a)
+        event_b = self.make_second_event()
+        turn_b = self.make_inflight_turn(adapter, event_b, token="delivery-token-2")
+        message_b = self.make_turn_message(adapter, turn_b)
+        adapter._inflight.pop(turn_b.event_id, None)  # 소유권 상실 재현
+        seen = {}
+
+        async def scenario():
+            _ACTIVE_QUEUE_EVENT_ID.set(claim_a["event_id"])
+            _ACTIVE_QUEUE_DELIVERY_TOKEN.set("delivery-token-1")
+            set_conversation_context("conv_stale_previous", claim_a["event_id"])
+            await adapter.on_processing_start(message_b)
+            seen["event_id"] = _ACTIVE_QUEUE_EVENT_ID.get()
+            seen["token"] = _ACTIVE_QUEUE_DELIVERY_TOKEN.get()
+            seen["conversation_id"] = get_session_env("HERMES_SESSION_CONVERSATION_ID")
+
+        asyncio.run(scenario())
+
+        self.assertEqual(seen["event_id"], claim_a["event_id"])
+        self.assertEqual(seen["token"], "delivery-token-1")
+        self.assertEqual(seen["conversation_id"], "conv_stale_previous")
+
+    def test_drain_turn_reply_binds_to_own_event_after_predecessor_completes(self):
+        """F2 회귀 핵심(침묵 유실 시나리오): 같은 대화의 후속 턴 B가 A 처리 중
+        도착해 코어 _pending_messages로 큐잉되면, A 완료 후 코어가 A 태스크
+        안에서 스폰한 drain 태스크가 B를 처리한다. 이때 B의 최종 답이 B
+        자신의 event를 causation으로 하는 reply로 append되고 B delivery가
+        completed로 마감돼야 한다. 재바인딩 없이는 drain 태스크가 A의 stale
+        컨텍스트를 상속해 send가 ownership-lost로 실패하고, B의 답이
+        유실된 채 delivery가 error(비재claim)로 남는다."""
+        claim_a = self.make_claim()
+        claim_b = self.make_claim(event=self.make_second_event())
+        adapter = self.make_v2_adapter(claim_a)
+        claim_b["worker"] = adapter._worker
+        claim_b["active_delivery_token"] = "delivery-token-2"
+
+        release_a = asyncio.Event()
+
+        async def handler(event):
+            if event.message_id == claim_a["event_id"]:
+                await release_a.wait()
+                return "A의 답"
+            return "B의 답"
+
+        adapter.set_message_handler(handler)
+
+        async def scenario():
+            self.assertTrue(await adapter._poll_once())
+            # A가 코어에서 처리되는 동안 후속 턴 B가 claim된다(busy → pending).
+            adapter._conversation_client.claim = copy.deepcopy(claim_b)
+            self.assertTrue(await adapter._poll_once())
+            release_a.set()
+            for _ in range(200):  # 최대 ~10초
+                if not adapter._inflight and not adapter._pending_messages:
+                    break
+                await asyncio.sleep(0.05)
+            await asyncio.sleep(0.2)
+
+        asyncio.run(scenario())
+
+        client = adapter._conversation_client
+        replies = [e for e in client.append_events if e["event_type"] == "reply"]
+        self.assertEqual(
+            [r["causation_id"] for r in replies],
+            [claim_a["event_id"], claim_b["event_id"]],
+        )
+        self.assertIn("B의 답", replies[1]["body"])
+        transitions = {}
+        for method, params in client.calls:
+            if method == "advance_delivery":
+                transitions.setdefault(params["event_id"], []).append(
+                    params["next_state"]
+                )
+        self.assertEqual(transitions[claim_a["event_id"]], ["accepted", "completed"])
+        self.assertEqual(transitions[claim_b["event_id"]], ["accepted", "completed"])
+
+    def test_on_processing_start_rebinds_v1_turn_event_id(self):
+        """v1 턴도 event_id는 재바인딩한다 — 드물게 코어 pending drain을 타는
+        레이스에서 직전 턴의 stale event_id 상속으로 후속 send가 fence에
+        걸리는 것을 막는다. v1엔 conversation 개념이 없으므로 conversation
+        ctx는 건드리지 않는다."""
+        from types import SimpleNamespace
+
+        from gateway.platforms.base import MessageEvent
+        from gateway.session_context import get_session_env, set_conversation_context
+        from plugins.platforms.queue.adapter import _ACTIVE_QUEUE_EVENT_ID
+
+        adapter = self.make_adapter()  # 기본 queue.v1
+        v1_turn = SimpleNamespace(
+            inbox_id=7, session_id="s-1", active_turn_id=7, slack_event_ts="1700.b"
+        )
+        adapter._inflight["1700.b"] = v1_turn
+        message_b = MessageEvent(
+            text="후속",
+            source=adapter.build_source(
+                chat_id="queue:C0B69KP8G2J",
+                chat_name="queue:C0B69KP8G2J",
+                chat_type="channel",
+                user_id="U0CHAD",
+                user_name="U0CHAD",
+                thread_id="1700.t",
+            ),
+            message_id="1700.b",
+        )
+        seen = {}
+
+        async def scenario():
+            _ACTIVE_QUEUE_EVENT_ID.set("1700.a")  # 직전 턴의 stale id
+            set_conversation_context("conv_stale_previous", "evt_stale")
+            await adapter.on_processing_start(message_b)
+            seen["event_id"] = _ACTIVE_QUEUE_EVENT_ID.get()
+            seen["conversation_id"] = get_session_env("HERMES_SESSION_CONVERSATION_ID")
+
+        asyncio.run(scenario())
+
+        self.assertEqual(seen["event_id"], "1700.b")
+        self.assertEqual(seen["conversation_id"], "conv_stale_previous")
+
+    # ---- F4: deferred-terminal — 도구 등록 → reply 뒤 어댑터가 append -------
+
+    def test_deferred_terminal_appends_after_reply_then_delivery_completed(self):
+        """§5 순서 기계 보장: 도구가 등록한 terminal은 즉시 append되지 않고,
+        코어가 최종 답(reply)을 발신한 뒤 on_processing_complete에서
+        append된다 — append 순서가 구조적으로 reply → terminal이다. terminal
+        event는 byte-stable(created_at 인바운드 승계)이고 안정 idempotency
+        key(queue_close:{agent}:{parent_event_id})를 쓴다."""
+        from gateway.conversation_closeout import register_deferred_terminal
+
+        claim = self.make_claim()
+        adapter = self.make_v2_adapter(claim)
+
+        async def handler(event):
+            register_deferred_terminal(
+                conversation_id=str(event.metadata["conversation_id"]),
+                parent_event_id=str(event.message_id),
+                event_type="completed",
+                body="요청 작업 완료",
+            )
+            return "최종 답이야"
+
+        adapter.set_message_handler(handler)
+
+        async def scenario():
+            self.assertTrue(await adapter._poll_once())
+            for _ in range(200):  # 최대 ~10초
+                if not adapter._inflight:
+                    break
+                await asyncio.sleep(0.05)
+            await asyncio.sleep(0.2)
+
+        asyncio.run(scenario())
+
+        self.assertEqual(
+            self.append_event_types(adapter), ["ack", "reply", "completed"]
+        )
+        terminal = adapter._conversation_client.append_events[-1]
+        self.assertEqual(terminal["causation_id"], claim["event_id"])
+        self.assertEqual(terminal["conversation_id"], claim["conversation_id"])
+        self.assertEqual(terminal["body"], "요청 작업 완료")
+        self.assertEqual(
+            terminal["idempotency_key"], f"queue_close:chami:{claim['event_id']}"
+        )
+        self.assertEqual(terminal["created_at"], claim["event"]["created_at"])
+        self.assertEqual(self.advance_states(adapter), ["accepted", "completed"])
+
+    def test_deferred_terminal_discarded_on_processing_failure(self):
+        """FAILURE 턴의 deferred terminal은 append 없이 폐기된다 — 답이 안
+        나간 대화를 도구 등록만으로 성급히 닫지 않는다(거짓 종결 방지).
+        등록은 턴 스코프라 결과와 무관하게 소진된다."""
+        from gateway.conversation_closeout import (
+            pop_deferred_terminal,
+            register_deferred_terminal,
+        )
+
+        claim = self.make_claim()
+        adapter = self.make_v2_adapter(claim)
+
+        async def handle(event):
+            register_deferred_terminal(
+                conversation_id=claim["conversation_id"],
+                parent_event_id=claim["event_id"],
+                event_type="failed",
+                body="처리 실패",
+            )
+            await adapter.on_processing_complete(event, self.outcome("FAILURE"))
+
+        adapter.handle_message = handle
+        self.assertTrue(asyncio.run(adapter._poll_once()))
+
+        self.assertEqual(self.advance_states(adapter), ["accepted", "error"])
+        self.assertEqual(self.append_event_types(adapter), ["ack"])
+        self.assertIsNone(pop_deferred_terminal(claim["event_id"]))
+
+    def test_deferred_terminal_not_appended_when_completion_fenced(self):
+        """advance(completed)가 fence로 거부되면(소유권/lease 상실) terminal도
+        append하지 않는다 — stale worker는 종결을 쓸 수 없다."""
+        from gateway.conversation_closeout import (
+            pop_deferred_terminal,
+            register_deferred_terminal,
+        )
+
+        claim = self.make_claim()
+        adapter = self.make_v2_adapter(claim)
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture
+
+        async def scenario():
+            self.assertTrue(await adapter._poll_once())
+            register_deferred_terminal(
+                conversation_id=claim["conversation_id"],
+                parent_event_id=claim["event_id"],
+                event_type="completed",
+                body="종결",
+            )
+            adapter._conversation_client.advance_error = RuntimeError(
+                "delivery lease ownership lost"
+            )
+            await adapter.on_processing_complete(captured[0], self.outcome("SUCCESS"))
+
+        asyncio.run(scenario())
+
+        self.assertEqual(self.append_event_types(adapter), ["ack"])
+        self.assertIsNone(pop_deferred_terminal(claim["event_id"]))
+
+    def test_deferred_terminal_append_failure_keeps_delivery_completed(self):
+        """terminal append 실패는 warning으로 가시화하고 delivery는 completed를
+        유지한다 — reply까지는 진실이며, 안 닫힌 대화는 열린 채 보이는 게
+        계약 철학(성급 종결 금지)에 부합한다. 예외는 훅 밖으로 새지 않는다."""
+        from gateway.conversation_closeout import register_deferred_terminal
+
+        claim = self.make_claim()
+        adapter = self.make_v2_adapter(claim)
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture
+
+        async def scenario():
+            self.assertTrue(await adapter._poll_once())
+            register_deferred_terminal(
+                conversation_id=claim["conversation_id"],
+                parent_event_id=claim["event_id"],
+                event_type="completed",
+                body="종결",
+            )
+            adapter._conversation_client.append_event_error = RuntimeError(
+                "ledger unavailable"
+            )
+            await adapter.on_processing_complete(captured[0], self.outcome("SUCCESS"))
+
+        asyncio.run(scenario())
+
+        self.assertEqual(self.advance_states(adapter), ["accepted", "completed"])
+        # ack는 poll 시점(주입 전) 성공분 1건뿐 — terminal은 실패해 기록 없음.
+        self.assertEqual(self.append_event_types(adapter), ["ack"])
+
+    def test_dispatch_marks_turn_active_and_completion_closes_it(self):
+        """SPEC-1 배선: dispatch가 활성 턴을 registry에 마킹해야 도구의 defer
+        등록이 허용되고, 완료훅이 닫아야 이후 상속 컨텍스트(백그라운드 워커)의
+        terminal이 defer 대신 즉시 append로 폴스루한다."""
+        from gateway.conversation_closeout import active_turn
+
+        claim = self.make_claim()
+        adapter = self.make_v2_adapter(claim)
+        captured = []
+        seen = {}
+
+        async def capture(event):
+            captured.append(event)
+            seen["active"] = active_turn(claim["event_id"])
+
+        adapter.handle_message = capture
+
+        async def scenario():
+            self.assertTrue(await adapter._poll_once())
+            await adapter.on_processing_complete(captured[0], self.outcome("SUCCESS"))
+
+        asyncio.run(scenario())
+
+        self.assertIsNotNone(seen["active"])
+        self.assertEqual(seen["active"].requester, "chadol")
+        self.assertEqual(seen["active"].conversation_id, claim["conversation_id"])
+        self.assertIsNone(active_turn(claim["event_id"]))
+
+    def test_deferred_terminal_conversation_mismatch_is_discarded(self):
+        """등록의 conversation_id가 턴의 대화와 다르면 terminal이 append되지
+        않는다 — 등록 단계(register가 활성 턴의 대화와 대조해 None)에서 1차
+        차단되고, 훅의 대조는 백스톱이다."""
+        from gateway.conversation_closeout import register_deferred_terminal
+
+        claim = self.make_claim()
+        adapter = self.make_v2_adapter(claim)
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture
+
+        async def scenario():
+            self.assertTrue(await adapter._poll_once())
+            register_deferred_terminal(
+                conversation_id="conv_other_conversation",
+                parent_event_id=claim["event_id"],
+                event_type="completed",
+                body="종결",
+            )
+            await adapter.on_processing_complete(captured[0], self.outcome("SUCCESS"))
+
+        asyncio.run(scenario())
+
+        self.assertEqual(self.advance_states(adapter), ["accepted", "completed"])
+        self.assertEqual(self.append_event_types(adapter), ["ack"])
+
     def test_invalid_claim_target_does_not_attempt_error_transition(self):
         claim = self.make_claim()
         claim["target_agent_id"] = "chadol"
