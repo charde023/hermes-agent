@@ -40,6 +40,7 @@ hermes가 canonical event를 생산한다 — 계약 SSOT는 slack_agent `design
 
 - **인바운드 게이팅**: `request`/`question`만 ack+코어 dispatch(`_ACTIONABLE_EVENT_TYPES`). 그 외 event_type은 ack·dispatch 없이 `accepted→completed`로 조용히 소비 — 안 하면 두 v2 어댑터 간 **무한 ack 핑퐁**(적대검증 재현 6홉). 에이전트 가시화는 P2.
 - **conversation_id는 방향 무관**(thread 해시)이고, 답신 handoff는 `HERMES_SESSION_CONVERSATION_ID`/`_EVENT_ID` ContextVar(세션 컨텍스트 통로)로 **부모를 승계**한다.
+- **대화 세대(epoch, #21 E1)**: terminal로 닫힌 스레드의 재사용 요청이 같은 conversation_id로 가면 ledger가 append를 영구 거부한다(스레드 벽돌·generic 400이라 클라이언트 식별 불가). 신규 발급 경로는 서버 `get_conversation_state`로 **비terminal 첫 세대를 탐색**해 열린 세대에 합류하거나 미존재 세대로 새 대화를 연다. 산식: epoch 0 = 기존 해시 그대로(하위호환·기존 대화 정체성 불변), N≥1만 seed·request identity에 포함(세대별 conversation_id/idempotency_key/event_id 분리 — 재시도 dedupe는 같은 세대 안에서만). 조회 실패(구서버 404 등)는 epoch 0 폴백(기존 동작). 턴 밖(요청자) terminal은 열린 세대가 있어야 하며 없으면 거부(빈 대화 생성-즉시-종결 방지). 답신(부모 승계)·활성 턴 내 deferred terminal은 탐색을 타지 않는다.
 - **producer event는 byte-stable이 계약**: `created_at`을 인바운드 event에서 승계 — 서버 dedupe가 payload_hash 일치를 요구해, 재빌드가 1바이트라도 다르면 idempotency collision→영구 error가 된다.
 - **producer 노이즈 게이트는 첫줄 prefix만**(`_is_producer_noise`). bridge `is_system_noise`(substring-anywhere)는 표시측 전용 — producer에서 쓰면 진짜 답변이 event째 소멸한다.
 - **같은 턴 terminal = deferred(F4, #45)**: 활성 인바운드 턴 안의 도구 terminal(completed/failed/no_action)은 즉시 append하지 않고 `gateway/conversation_closeout.py`에 등록만 한다(도구 반환 `deferred=true`) — 어댑터 `on_processing_complete`가 SUCCESS 시 reply 발신 뒤 append해 §5 순서(reply→terminal)를 기계 보장(안정 키 `queue_close:{agent}:{parent_event_id}`·created_at 승계 byte-stable). FAILURE/CANCELLED·advance fence·conversation 불일치는 폐기. ★"활성 턴" 판정 권위는 ContextVar 존재가 아니라 **활성 턴 registry**(dispatch가 `mark_turn_active`, 훅이 `mark_turn_closed`로 원자 소비)다 — 스냅샷은 턴 종료 후에도 상속처(delegate background 워커)에 남아, 존재만으로 defer하면 고아 등록(성공 반환 동반 침묵 소실)이 된다. 활성 턴 안 terminal은 그 턴의 요청자(to==requester)에게만 — 다른 handoff 종결은 턴 밖에서(즉시 append). 잔여 창: advance(completed) 성공 직후(또는 응답만 유실) terminal append 전 크래시/파티션이면 delivery가 completed라 재claim이 없어 그 턴의 종결 의도만 소실 — 대화는 열린 채 가시적으로 남고 요청자측/후속 턴 종결이 폴백(§5 "성급 종결 금지" 철학상 안전측).
@@ -58,7 +59,7 @@ hermes가 canonical event를 생산한다 — 계약 SSOT는 slack_agent `design
 - 발신 전 fencing과 DB INSERT 사이에는 미세한 TOCTOU가 남는다. 완전 제거는 원자적 finish RPC가 필요하다.
 - 라이브 APOM 설치 성공은 코드·설정 지원과 별개다. OAuth receipt, APOM inbound, APOM outbound, 재시작 후 지속성까지 각각 증거가 필요하다.
 - `workspace_keys`가 있으면 `auth.test`로 확인된 workspace 집합과 정확히 같아야 한다. 예상 밖 workspace를 영수증에 추가하면 관제탑이 전체 receipt를 거부한다.
-- 현재 Agent Directory fixture에는 `chami`, `chadol`, `smith`만 있다. `may`, `anna`, `jeff`는 Directory 등록 전 성공으로 보고하지 않는다.
+- 현재 Agent Directory fixture에는 `chami`, `chadol`, `smith`, `claude-dev`(queue_native·러너 #21 E2·slack_app 없음)가 있다. `may`, `anna`, `jeff`는 Directory 등록 전 성공으로 보고하지 않는다.
 
 ## 변경 시 게이트
 

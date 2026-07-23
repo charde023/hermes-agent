@@ -78,6 +78,12 @@ _HANDOFF_EVENT_PREFIX = "qh-"
 _CONVERSATION_PROTOCOL = "conversation.v1"
 _LEGACY_PROTOCOL = "queue.v1"
 _IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
+# E1(#21) 대화 세대(epoch): 서버 ledger의 terminal lifecycle 3종(계약 §3)과 동기.
+# conversation_id 산식이 스레드 해시뿐이면 terminal로 닫힌 스레드의 재사용
+# 요청이 같은 conversation_id로 가서 append가 영구 거부된다(스레드 벽돌) —
+# 발급 전 get_conversation_state로 비terminal 첫 세대를 탐색한다.
+_TERMINAL_LIFECYCLES = {"DONE", "FAILED", "NO_ACTION"}
+_MAX_THREAD_GENERATIONS = 128
 _SLACK_TOKEN_RE = re.compile(r"xox(?:a|b|p|r|s)-[A-Za-z0-9-]+", re.IGNORECASE)
 _DELIVERY_STATES = {"pending", "claimed", "accepted", "completed", "error"}
 _TRUST_TIERS = {
@@ -391,6 +397,74 @@ def _canonical_hash(value: Mapping) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _conversation_id_for_thread(thread_ts: str, epoch: int = 0) -> str:
+    """스레드→conversation_id 산식(계약 D2 + E1 세대).
+
+    epoch 0은 seed에 키 자체를 넣지 않아 **기존 해시와 byte-identical**(하위호환
+    — 기존 발급분·열린 대화의 정체성을 바꾸지 않는다). N≥1만 seed에 포함돼
+    세대별로 conversation_id가 갈라진다.
+    """
+    seed: dict = {"thread_ts": thread_ts}
+    if epoch:
+        seed["epoch"] = int(epoch)
+    return f"qh_conv_{_canonical_hash(seed)[:32]}"
+
+
+class ThreadGenerationLimitError(RuntimeError):
+    """세대 탐색이 상한(``_MAX_THREAD_GENERATIONS``)을 넘었다.
+
+    조회 실패(구서버 404·일시 장애)와 달리 이건 실제 비정상(한 스레드에
+    terminal 세대 128개 이상)이다 — 호출부의 조회 실패 폴백(epoch 0)에
+    흡수되면 안 된다. 흡수되면 이미 오래전에 terminal로 닫힌 세대의
+    conversation_id로 조용히 재발급해, 이 기능이 막으려던 '스레드 벽돌'을
+    그대로 재현한다(E1-5). 반드시 조회 실패 catch보다 먼저 잡아야 한다.
+    """
+
+
+def _probe_open_generation(
+    *, thread_ts: str, query, max_generations: int = _MAX_THREAD_GENERATIONS
+):
+    """비terminal 첫 세대를 찾는다 → ``(epoch, exists)``.
+
+    ``exists=False``면 그 세대 대화가 아직 없다(발급 시 새 대화로 열림).
+    ``query``는 conversation_id → lifecycle_state 문자열 | None(미존재)이며,
+    조회 예외(구서버 404·일시 장애)는 호출부가 epoch 0 폴백으로 처리한다.
+    상한 초과는 비정상(한 스레드에 terminal 세대 128+)이라 전용 예외
+    (``ThreadGenerationLimitError``)로 올린다 — 호출부가 조회 실패 폴백과
+    구분해서 처리해야 한다(같은 except로 뭉치면 폴백에 삼켜진다).
+    """
+    for epoch in range(max_generations):
+        state = query(_conversation_id_for_thread(thread_ts, epoch))
+        if state is None:
+            return epoch, False
+        if state not in _TERMINAL_LIFECYCLES:
+            return epoch, True
+    raise ThreadGenerationLimitError(
+        f"thread generation limit exceeded ({max_generations})"
+    )
+
+
+def _query_conversation_state(
+    repo_root: str, *, endpoint: str, credential: str, conversation_id: str
+) -> str | None:
+    """blocking 세대 조회(get_conversation_state). 미존재는 None.
+
+    credential은 반환·상태에 저장하지 않는다. 서버가 이 메서드를 모르는
+    구버전이면 HTTP 404 → RuntimeError — 호출부가 epoch 0으로 폴백한다.
+    """
+    if repo_root and repo_root not in sys.path:
+        sys.path.append(repo_root)
+    from bridge.conversation_http import HttpConversationClient
+
+    result = HttpConversationClient(endpoint, credential).call(
+        "get_conversation_state", {"conversation_id": conversation_id}
+    )
+    if not isinstance(result, dict):
+        raise RuntimeError("conversation API returned an invalid state")
+    state = result.get("lifecycle_state")
+    return None if state is None else str(state)
+
+
 def _validated_idempotency_key(value: object) -> str:
     key = str(value or "").strip()
     if not key or _IDEMPOTENCY_KEY_RE.fullmatch(key) is None:
@@ -438,6 +512,7 @@ def _request_identity(
     thread_ts: str,
     source_anchor: str,
     event_type: str = _DEFAULT_EVENT_TYPE,
+    epoch: int = 0,
 ) -> dict:
     identity = {
         "sender_agent_id": agent,
@@ -452,6 +527,10 @@ def _request_identity(
     # 다르면 서로 다른 idempotency_key(다른 canonical event)로 갈라지게 한다.
     if event_type != _DEFAULT_EVENT_TYPE:
         identity["event_type"] = event_type
+    # 세대 0도 같은 이유로 키를 넣지 않는다(기존 해시 보존). N≥1이면 세대별로
+    # idempotency_key/event_id가 갈라져 재시도 dedupe는 같은 세대 안에서만 성립.
+    if epoch:
+        identity["epoch"] = int(epoch)
     return identity
 
 
@@ -491,8 +570,10 @@ def _build_conversation_event(
         conversation_id = parent_conversation_id
         causation_id = parent_event_id or (source_anchor or None)
     else:
-        conversation_digest = _canonical_hash({"thread_ts": thread_ts})
-        conversation_id = f"qh_conv_{conversation_digest[:32]}"
+        # E1: request identity에 실린 세대(없으면 0)를 산식에 반영한다.
+        conversation_id = _conversation_id_for_thread(
+            thread_ts, int(request.get("epoch") or 0)
+        )
         causation_id = source_anchor or None
 
     summary = " ".join(message.split())[:200] or "queue handoff request"
@@ -800,6 +881,66 @@ async def queue_handoff_tool(args: dict, **kw) -> str:
                                 "order. It is discarded if this turn fails."
                             ),
                         )
+            if not parent_conversation_id:
+                # E1(#21) 대화 세대: 신규 발급 전 이 스레드의 비terminal 첫
+                # 세대를 서버 조회로 탐색한다 — terminal로 닫힌 세대의
+                # conversation_id를 재사용하면 ledger가 append를 영구 거부해
+                # (generic 400) 스레드가 벽돌이 된다. 조회 실패(구서버 404·
+                # 일시 장애)는 epoch 0 폴백 — 세대 기능이 없던 기존 동작과
+                # 동일하게 발급을 계속한다(fail-soft 하위호환).
+                probe_outcome = None
+                try:
+                    def _probe():
+                        return _probe_open_generation(
+                            thread_ts=thread_ts,
+                            query=lambda cid: _query_conversation_state(
+                                repo_root,
+                                endpoint=endpoint,
+                                credential=conversation_credential,
+                                conversation_id=cid,
+                            ),
+                        )
+
+                    probe_outcome = await asyncio.to_thread(_probe)
+                except ThreadGenerationLimitError:
+                    # E1-5(+STD-7): 상한 초과는 조회 실패와 달리 실제
+                    # 비정상이다 — 아래 포괄 except의 epoch 0 폴백에 흡수되면
+                    # 이미 오래전에 닫힌 세대로 조용히 재발급해 벽돌을
+                    # 재현한다. 여기서 먼저 잡아 설계된 명시 에러로 거부하고
+                    # (발급을 시도하지 않는다) 폴백 경로에 못 닿게 한다.
+                    return tool_error(
+                        "thread generation limit exceeded (128) — no open "
+                        "generation on this thread; start a new thread"
+                    )
+                except Exception:  # noqa: BLE001 — 폴백이 하위호환 동작
+                    probe_outcome = None
+                if probe_outcome is not None:
+                    epoch, generation_exists = probe_outcome
+                    if event_type in TERMINAL_EVENT_TYPES and not generation_exists:
+                        # 열린 세대가 없는 스레드에 terminal을 보내면 '빈 대화를
+                        # 생성-즉시-종결'하는 쓰레기가 된다 — 발급 없이 거부.
+                        return tool_error(
+                            "no open conversation to close on this thread — a "
+                            "terminal event outside an active turn must target "
+                            "an open conversation"
+                        )
+                    if epoch:
+                        request = _request_identity(
+                            agent=agent,
+                            target=to,
+                            message=message,
+                            thread_ts=thread_ts,
+                            source_anchor=source_anchor,
+                            event_type=event_type,
+                            epoch=epoch,
+                        )
+                        try:
+                            idempotency_key = _stable_idempotency_key(
+                                request, args.get("idempotency_key")
+                            )
+                        except ValueError as exc:
+                            return tool_error(str(exc))
+                        request_hash = _canonical_hash(request)
             candidate_event = _build_conversation_event(
                 request=request,
                 idempotency_key=idempotency_key,
@@ -863,6 +1004,35 @@ async def queue_handoff_tool(args: dict, **kw) -> str:
         )
         await asyncio.to_thread(store.update_status, idempotency_key, "enqueued")
     except ReceiptCollisionError as exc:
+        # E1-3(#21): explicit idempotency_key로 재시도하는 사이 이 스레드의
+        # 대화 세대가 전진하면(닫힘 → 다음 세대가 열림), 이번 request
+        # identity에 세대가 반영돼 request_hash가 최초 저장분과 달라진다 —
+        # 캐노니컬 caller key 파생은 explicit 값 자체에서만 나오므로 같은
+        # key인데 request_hash만 달라 "다른 요청"으로 충돌한다. 원인을 밝히지
+        # 않으면 영구 미스터리 에러다. 세대 전진 흔적(이번 request의
+        # epoch>0)이 있고 저장된 record의 conversation_id가 이번 candidate와
+        # 실제로 다를 때만 원인을 명시한다. 자동 supersede(저장 교체)는 하지
+        # 않는다 — 멱등 계약을 조용히 바꾸지 않고 새 key로 재시도를 유도한다
+        # (fail-visible). 그 외 진짜 충돌은 기존 메시지를 그대로 유지한다.
+        explicit_key_used = bool(str(args.get("idempotency_key") or "").strip())
+        if (
+            protocol == _CONVERSATION_PROTOCOL
+            and explicit_key_used
+            and int(request.get("epoch") or 0) > 0
+        ):
+            try:
+                stored = await asyncio.to_thread(store.get, idempotency_key)
+            except Exception:  # noqa: BLE001 — 진단 조회 실패는 기존 메시지로 폴백
+                stored = None
+            if stored is not None and stored.event.get(
+                "conversation_id"
+            ) != candidate_event.get("conversation_id"):
+                return tool_error(
+                    "idempotency_key was reserved for a previous conversation "
+                    "generation (the thread's conversation closed and "
+                    "advanced) — retry with a NEW idempotency_key",
+                    idempotency_key=idempotency_key,
+                )
         return tool_error(str(exc), idempotency_key=idempotency_key)
     except Exception as exc:  # noqa: BLE001 — 어떤 실패든 도구 계약(JSON error)로 변환
         return tool_error(
@@ -938,7 +1108,11 @@ QUEUE_HANDOFF_SCHEMA = {
                 "description": (
                     "Optional stable caller key for handoff retries; the tool derives one "
                     "when omitted. Required for action=receipt. Reusing a key with different "
-                    "target/message/thread is rejected as a collision."
+                    "target/message/thread is rejected as a collision. Reuse is only stable "
+                    "within the same conversation generation on this thread — if the "
+                    "thread's conversation closed and a new generation opened since your "
+                    "first call, the retry is rejected as a collision too; use a NEW "
+                    "idempotency_key in that case."
                 ),
             },
             "event_type": {
@@ -969,7 +1143,12 @@ QUEUE_HANDOFF_SCHEMA = {
                     "active turn). If this turn fails, the deferred terminal is "
                     "discarded (the conversation stays open). Outside an active "
                     "inbound turn (e.g. closing a handoff you initiated earlier), "
-                    "the terminal is appended immediately as before."
+                    "the tool searches this thread for its open conversation "
+                    "generation and appends the terminal there immediately. If "
+                    "the thread has no open conversation (never started, or "
+                    "every generation on it is already closed), the call is "
+                    "rejected with a 'no open conversation to close' error — "
+                    "retrying will not help; there is nothing left to close."
                 ),
             },
         },

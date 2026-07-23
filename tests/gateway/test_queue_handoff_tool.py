@@ -923,6 +923,354 @@ class TestConversationV1DeferredTerminal(QueueHandoffToolTestBase):
         self.assertFalse(result.get("deferred", False))
 
 
+class TestConversationGenerationProbe(QueueHandoffToolTestBase):
+    """#21 E1(대화 세대): 신규 발급 경로는 서버 get_conversation_state로 스레드의
+    현재 세대를 탐색한다 — terminal(DONE/FAILED/NO_ACTION)로 닫힌 세대는 건너뛰고
+    비terminal(열린) 세대에 합류하거나 미존재 첫 세대로 새 대화를 연다. 세대
+    산식은 epoch 0 = 기존 해시 그대로(하위호환), N≥1만 해시에 epoch 포함."""
+
+    V2_ENV = {
+        "QUEUE_PROTOCOL_VERSION": "conversation.v1",
+        "QUEUE_ENDPOINT": "http://127.0.0.1:8770",
+        "QUEUE_CONVERSATION_CREDENTIAL": "private-agent-credential",
+    }
+
+    @staticmethod
+    def _fake_append(*args, **kwargs):
+        return {
+            "receipt": "enqueued",
+            "event_id": kwargs["event"]["event_id"],
+            "delivery_status": "pending",
+            "inserted": True,
+        }
+
+    def _call_with_probe(self, states, **tool_args):
+        """states: conversation_id 순서대로 돌려줄 lifecycle 시퀀스(None=미존재).
+        반환: (도구 결과, probe가 조회한 conversation_id 목록, append된 event 목록)."""
+        probed = []
+        appended = []
+
+        def fake_query(repo_root, *, endpoint, credential, conversation_id):
+            probed.append(conversation_id)
+            if not states:
+                raise AssertionError("probe called more times than states provided")
+            state = states.pop(0)
+            if isinstance(state, Exception):
+                raise state
+            return state
+
+        def fake_append(*args, **kwargs):
+            appended.append(kwargs["event"])
+            return self._fake_append(*args, **kwargs)
+
+        with patch.dict(os.environ, self.V2_ENV, clear=False), patch(
+            "tools.queue_handoff_tool._query_conversation_state",
+            side_effect=fake_query,
+        ), patch(
+            "tools.queue_handoff_tool._do_conversation_append",
+            side_effect=fake_append,
+        ):
+            result = self.call_tool(**tool_args)
+        return result, probed, appended
+
+    def test_open_epoch_zero_reuses_legacy_conversation_id(self):
+        """epoch 0이 열려 있으면 기존 산식 그대로 그 대화에 합류한다 — 세대
+        도입이 기존 열린 대화의 정체성을 바꾸면 안 된다(하위호환)."""
+        from tools.queue_handoff_tool import _canonical_hash
+
+        result, probed, appended = self._call_with_probe(
+            ["OPEN"], to="chadol", message="세대 확인", thread="epoch-t1"
+        )
+
+        self.assertTrue(result.get("success"), result)
+        legacy_conversation = (
+            f"qh_conv_{_canonical_hash({'thread_ts': 'epoch-t1'})[:32]}"
+        )
+        self.assertEqual(probed, [legacy_conversation])
+        self.assertEqual(len(appended), 1)
+        self.assertEqual(appended[0]["conversation_id"], legacy_conversation)
+
+    def test_terminal_generations_are_skipped_to_next_open_or_new(self):
+        """DONE·FAILED로 닫힌 세대는 건너뛰고 미존재 첫 세대로 새 대화를 연다 —
+        닫힌 스레드 재사용이 'conversation already terminal' 벽돌이 되지 않는다.
+        세대별로 conversation_id·event_id·idempotency_key가 전부 갈라진다."""
+        from tools.queue_handoff_tool import _canonical_hash
+
+        result, probed, appended = self._call_with_probe(
+            ["DONE", "FAILED", None], to="chadol", message="세 번째 세대", thread="epoch-t2"
+        )
+
+        self.assertTrue(result.get("success"), result)
+        gen0 = f"qh_conv_{_canonical_hash({'thread_ts': 'epoch-t2'})[:32]}"
+        gen1 = f"qh_conv_{_canonical_hash({'thread_ts': 'epoch-t2', 'epoch': 1})[:32]}"
+        gen2 = f"qh_conv_{_canonical_hash({'thread_ts': 'epoch-t2', 'epoch': 2})[:32]}"
+        self.assertEqual(probed, [gen0, gen1, gen2])
+        self.assertEqual(appended[0]["conversation_id"], gen2)
+        # 세대가 다르면 idempotency/event 정체성도 갈라진다(재시도 dedupe는
+        # 같은 세대 안에서만) — epoch 0으로 계산한 key와 달라야 한다.
+        from tools.queue_handoff_tool import _request_identity, _stable_idempotency_key
+
+        key_gen0 = _stable_idempotency_key(
+            _request_identity(
+                agent="chami",
+                target="chadol",
+                message="세 번째 세대",
+                thread_ts="epoch-t2",
+                source_anchor="",
+            )
+        )
+        self.assertNotEqual(appended[0]["idempotency_key"], key_gen0)
+        self.assertNotEqual(appended[0]["conversation_id"], gen0)
+
+    def test_probe_failure_falls_back_to_epoch_zero(self):
+        """조회 실패(구서버 404·일시 장애)는 epoch 0 폴백 — 세대 기능이 없던
+        기존 동작과 동일하게 발급을 계속한다(fail-soft 하위호환)."""
+        from tools.queue_handoff_tool import _canonical_hash
+
+        result, probed, appended = self._call_with_probe(
+            [RuntimeError("conversation API HTTP 404")],
+            to="chadol",
+            message="폴백 발급",
+            thread="epoch-t3",
+        )
+
+        self.assertTrue(result.get("success"), result)
+        gen0 = f"qh_conv_{_canonical_hash({'thread_ts': 'epoch-t3'})[:32]}"
+        self.assertEqual(appended[0]["conversation_id"], gen0)
+
+    def test_requester_terminal_without_open_generation_is_rejected(self):
+        """턴 밖(요청자) terminal은 열린 세대가 있어야 한다 — 전부 닫혔거나
+        존재한 적 없는 스레드에 completed를 보내면 '빈 대화를 생성-즉시-종결'
+        하는 쓰레기가 되므로 발급 없이 명시 거부한다."""
+        result, probed, appended = self._call_with_probe(
+            ["DONE", None], to="chadol", message="닫을 게 없다", event_type="completed",
+            thread="epoch-t4",
+        )
+
+        self.assertIn("error", result)
+        self.assertIn("no open conversation", result["error"])
+        self.assertEqual(appended, [])
+
+    def test_requester_terminal_joins_open_generation(self):
+        """열린 세대가 있으면 요청자 terminal은 그 세대에 append된다(정상 종결)."""
+        from tools.queue_handoff_tool import _canonical_hash
+
+        result, probed, appended = self._call_with_probe(
+            ["DONE", "OPEN"], to="chadol", message="두 번째 세대 종결",
+            event_type="completed", thread="epoch-t5",
+        )
+
+        self.assertTrue(result.get("success"), result)
+        gen1 = f"qh_conv_{_canonical_hash({'thread_ts': 'epoch-t5', 'epoch': 1})[:32]}"
+        self.assertEqual(appended[0]["conversation_id"], gen1)
+
+    def test_reply_with_parent_context_skips_generation_probe(self):
+        """답신(활성 인바운드 턴의 부모 승계)은 세대 탐색을 하지 않는다 —
+        부모 conversation_id를 그대로 승계하는 기존 계약(D2) 유지."""
+        probed = []
+
+        def fake_query(*args, **kwargs):
+            probed.append(kwargs.get("conversation_id"))
+            return "OPEN"
+
+        with patch.dict(
+            os.environ,
+            {
+                **self.V2_ENV,
+                "HERMES_SESSION_CONVERSATION_ID": "conv_queue_example_001",
+                "HERMES_SESSION_CONVERSATION_EVENT_ID": "evt_queue_example_001",
+            },
+            clear=False,
+        ), patch(
+            "tools.queue_handoff_tool._query_conversation_state",
+            side_effect=fake_query,
+        ), patch(
+            "tools.queue_handoff_tool._do_conversation_append",
+            side_effect=self._fake_append,
+        ) as do_append:
+            result = self.call_tool(to="chadol", message="부모 승계 답신")
+
+        self.assertTrue(result.get("success"), result)
+        self.assertEqual(probed, [])
+        appended = do_append.call_args.kwargs["event"]
+        self.assertEqual(appended["conversation_id"], "conv_queue_example_001")
+
+    def test_generation_limit_exceeded_returns_explicit_error_not_fallback(self):
+        """[minor E1-5 + info STD-7] 상한(128) 초과는 조회 실패(구서버 404 등)와
+        다른 진짜 비정상 상황이다 — 호출부의 포괄 except가 이걸 조회 실패와
+        똑같이 삼켜 epoch 0로 폴백하면, 이미 오래전에 닫힌 세대의
+        conversation_id를 재사용해 이 기능이 막으려던 '스레드 벽돌'을 그대로
+        재현한다. 전용 예외가 도달해 발급 자체를 막고 명시 에러를 반환해야
+        한다."""
+        states = ["DONE"] * 128  # 0..127 전부 terminal → open/미존재 세대를 못 찾음
+        result, probed, appended = self._call_with_probe(
+            states, to="chadol", message="128번째 세대", thread="epoch-limit"
+        )
+
+        self.assertIn("error", result)
+        self.assertNotIn("success", result)
+        self.assertIn("generation limit", result["error"])
+        self.assertEqual(len(probed), 128)
+        # 폴백 발급이 아니어야 한다 — epoch 0(오래전에 닫힌 세대)로 조용히
+        # 재발급하면 안 된다.
+        self.assertEqual(appended, [])
+
+
+class TestReceiptCollisionGenerationAdvance(QueueHandoffToolTestBase):
+    """[major E1-3] explicit idempotency_key로 재시도하는 사이 스레드의 대화
+    세대가 전진하면(닫힘→다음 세대가 열림), 이번 request identity에 세대가
+    반영돼 request_hash가 최초 저장분과 달라진다 — 같은 caller key가 "다른
+    요청"으로 충돌해 원인 불가시인 영구 에러가 된다(#21 적대검증 E1-3).
+    세대-인지 명시 에러로 원인을 밝혀야 하고, 그 외 진짜 충돌은 기존 메시지를
+    유지해야 한다."""
+
+    V2_ENV = {
+        "QUEUE_PROTOCOL_VERSION": "conversation.v1",
+        "QUEUE_ENDPOINT": "http://127.0.0.1:8770",
+        "QUEUE_CONVERSATION_CREDENTIAL": "private-agent-credential",
+    }
+
+    @staticmethod
+    def _fake_append(*args, **kwargs):
+        return {
+            "receipt": "enqueued",
+            "event_id": kwargs["event"]["event_id"],
+            "delivery_status": "pending",
+            "inserted": True,
+        }
+
+    def _call_with_states(self, states, **tool_args):
+        def fake_query(repo_root, *, endpoint, credential, conversation_id):
+            if not states:
+                raise AssertionError("probe called more times than states provided")
+            state = states.pop(0)
+            if isinstance(state, Exception):
+                raise state
+            return state
+
+        with patch.dict(os.environ, self.V2_ENV, clear=False), patch(
+            "tools.queue_handoff_tool._query_conversation_state",
+            side_effect=fake_query,
+        ), patch(
+            "tools.queue_handoff_tool._do_conversation_append",
+            side_effect=self._fake_append,
+        ):
+            return self.call_tool(**tool_args)
+
+    def test_generation_advance_collision_returns_generation_aware_error(self):
+        """1차 호출은 열린 epoch 0에 저장된다. 그 사이 대화가 닫히고(DONE)
+        다음 세대(epoch 1)가 열리면, 같은 explicit key + 같은 to/message/thread
+        재시도는 다른 request_hash(epoch 포함)로 충돌한다 — 옛 미스터리 문구
+        대신 세대-인지 에러(새 key로 재시도 유도)를 반환해야 한다."""
+        first = self._call_with_states(
+            ["OPEN"],
+            to="chadol",
+            message="원본 요청",
+            thread="epoch-collide-1",
+            idempotency_key="retry-job-1",
+        )
+        self.assertTrue(first.get("success"), first)
+
+        second = self._call_with_states(
+            ["DONE", "OPEN"],
+            to="chadol",
+            message="원본 요청",
+            thread="epoch-collide-1",
+            idempotency_key="retry-job-1",
+        )
+
+        self.assertIn("error", second)
+        self.assertIn("previous conversation generation", second["error"])
+        self.assertIn("NEW idempotency_key", second["error"])
+        # 옛 미스터리 문구("already belongs to another request")로 원인을
+        # 가리면 안 된다 — 재발 방지 핵심 단언.
+        self.assertNotIn("already belongs to another request", second["error"])
+
+    def test_genuine_collision_without_generation_advance_keeps_original_message(self):
+        """세대 전진 흔적이 없는(둘 다 epoch 0) 진짜 충돌(다른 message로 같은
+        key 재사용)은 세대-인지 오분류 없이 기존 collision 메시지를 유지해야
+        한다 — 자동 supersede도 하지 않는다(멱등 계약을 조용히 안 바꿈)."""
+        first = self._call_with_states(
+            ["OPEN"],
+            to="chadol",
+            message="원본",
+            thread="topic-no-epoch",
+            idempotency_key="job-same-gen",
+        )
+        self.assertTrue(first.get("success"), first)
+
+        second = self._call_with_states(
+            ["OPEN"],
+            to="chadol",
+            message="변조된 내용",
+            thread="topic-no-epoch",
+            idempotency_key="job-same-gen",
+        )
+
+        self.assertIn("error", second)
+        self.assertIn("collision", second["error"])
+        self.assertNotIn("previous conversation generation", second["error"])
+
+
+class TestQueryConversationStateBody(QueueHandoffToolTestBase):
+    """[info STD-8] `_query_conversation_state` 본체는 다른 모든 테스트에서
+    함수 자체가 mock 경계라 실행되지 않는다 — 여기서 함수를 직접 호출해
+    HttpConversationClient.call() 결과 매핑 3가지를 검증한다(HTTP 실왕복 없음,
+    HttpConversationClient 클래스 자체를 patch)."""
+
+    @unittest.skipUnless(
+        _HAS_CONVERSATION_V1,
+        f"slack_agent conversation.v1 contract not found: {SLACK_AGENT_ROOT}",
+    )
+    def test_query_conversation_state_body_maps_http_result(self):
+        from tools.queue_handoff_tool import _query_conversation_state
+
+        with self.subTest("lifecycle_state present"):
+            with patch("bridge.conversation_http.HttpConversationClient") as client_cls:
+                client_cls.return_value.call.return_value = {
+                    "conversation_id": "qh_conv_abc",
+                    "lifecycle_state": "DONE",
+                }
+                state = _query_conversation_state(
+                    SLACK_AGENT_ROOT,
+                    endpoint="http://127.0.0.1:8770",
+                    credential="private-agent-credential",
+                    conversation_id="qh_conv_abc",
+                )
+            self.assertEqual(state, "DONE")
+            client_cls.assert_called_once_with(
+                "http://127.0.0.1:8770", "private-agent-credential"
+            )
+            client_cls.return_value.call.assert_called_once_with(
+                "get_conversation_state", {"conversation_id": "qh_conv_abc"}
+            )
+
+        with self.subTest("lifecycle_state None means missing"):
+            with patch("bridge.conversation_http.HttpConversationClient") as client_cls:
+                client_cls.return_value.call.return_value = {
+                    "conversation_id": "qh_conv_missing",
+                    "lifecycle_state": None,
+                }
+                state = _query_conversation_state(
+                    SLACK_AGENT_ROOT,
+                    endpoint="http://127.0.0.1:8770",
+                    credential="private-agent-credential",
+                    conversation_id="qh_conv_missing",
+                )
+            self.assertIsNone(state)
+
+        with self.subTest("non-dict result raises"):
+            with patch("bridge.conversation_http.HttpConversationClient") as client_cls:
+                client_cls.return_value.call.return_value = "not-a-dict"
+                with self.assertRaises(RuntimeError):
+                    _query_conversation_state(
+                        SLACK_AGENT_ROOT,
+                        endpoint="http://127.0.0.1:8770",
+                        credential="private-agent-credential",
+                        conversation_id="qh_conv_abc",
+                    )
+
+
 class TestReceiptStoreConcurrency(QueueHandoffToolTestBase):
     def test_same_key_concurrent_reserve_selects_one_durable_event(self):
         from tools.queue_handoff_receipts import QueueHandoffReceiptStore
