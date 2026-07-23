@@ -1134,6 +1134,10 @@ class _FakeConversationClient:
         self.claim = copy.deepcopy(claim)
         self.calls = []
         self.advance_error = None
+        # C3: append_event(자동 ack/reply)를 주입 실패시키거나 응답을 검사하기
+        # 위한 훅. append_events는 append_event로 넘어온 event dict만 순서대로 쌓는다.
+        self.append_event_error = None
+        self.append_events = []
 
     def call(self, method, params):
         self.calls.append((method, copy.deepcopy(dict(params))))
@@ -1144,6 +1148,17 @@ class _FakeConversationClient:
             if self.advance_error is not None:
                 raise self.advance_error
             return {"updated": True, "delivery_status": params["next_state"]}
+        if method == "append_event":
+            if self.append_event_error is not None:
+                raise self.append_event_error
+            event = params["event"]
+            self.append_events.append(copy.deepcopy(event))
+            return {
+                "receipt": "enqueued",
+                "event_id": event.get("event_id"),
+                "delivery_status": "pending",
+                "inserted": True,
+            }
         raise AssertionError(f"unexpected conversation method: {method}")
 
 
@@ -1170,6 +1185,9 @@ class TestConversationV1Adapter(QueueAdapterTestBase):
         }
 
     def make_v2_adapter(self, claim):
+        # F5: 노이즈 게이팅은 이제 adapter-local _is_producer_noise(모듈 함수)
+        # 다 — connect()가 채우던 인스턴스 속성(self._is_system_noise)이 없어져,
+        # 여기서 배선할 것도 없다(순수 함수라 fixture가 따로 주입할 필요가 없음).
         adapter = self.make_adapter(
             env_overrides={
                 "QUEUE_PROTOCOL_VERSION": "conversation.v1",
@@ -1190,6 +1208,105 @@ class TestConversationV1Adapter(QueueAdapterTestBase):
             for method, params in adapter._conversation_client.calls
             if method == "advance_delivery"
         ]
+
+    def append_event_types(self, adapter):
+        return [event["event_type"] for event in adapter._conversation_client.append_events]
+
+    # ---- C3: 자동 ack + 노이즈 게이팅 reply --------------------------------
+
+    def test_accepted_dispatch_sends_ack_event_exactly_once(self):
+        """accepted 전이 직후·코어 인계 전에 ack event가 정확히 1회 나간다."""
+        claim = self.make_claim()
+        adapter = self.make_v2_adapter(claim)
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture
+        self.assertTrue(asyncio.run(adapter._poll_once()))
+
+        client = adapter._conversation_client
+        # claim_delivery -> advance_delivery(accepted) -> append_event(ack) 순서.
+        # dispatch(capture)는 아무 conversation 호출도 하지 않으므로 이게 전부다.
+        self.assertEqual(
+            [method for method, _params in client.calls],
+            ["claim_delivery", "advance_delivery", "append_event"],
+        )
+        self.assertEqual(len(client.append_events), 1)
+        ack_event = client.append_events[0]
+        self.assertEqual(ack_event["event_type"], "ack")
+        self.assertEqual(ack_event["body"], "ack")
+        self.assertEqual(ack_event["causation_id"], claim["event_id"])
+        self.assertEqual(ack_event["conversation_id"], claim["conversation_id"])
+        self.assertEqual(ack_event["sender_agent_id"], "chami")
+        self.assertEqual(ack_event["target_agent_ids"], ["chadol"])
+        self.assertEqual(
+            ack_event["idempotency_key"], f"queue_ack:chami:{claim['event_id']}"
+        )
+        self.assertEqual(len(captured), 1)
+
+    def test_ack_append_failure_is_fail_soft_and_dispatch_still_proceeds(self):
+        """ack append 실패는 fail-soft — handle_message는 여전히 호출되고
+        delivery 전이(accepted->completed)도 정상 진행된다."""
+        claim = self.make_claim()
+        adapter = self.make_v2_adapter(claim)
+        adapter._conversation_client.append_event_error = RuntimeError(
+            "ledger unavailable"
+        )
+        captured = []
+        adapter.handle_message = self.completing_handle(adapter, captured)
+
+        self.assertTrue(asyncio.run(adapter._poll_once()))
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(self.advance_states(adapter), ["accepted", "completed"])
+        # 실패했으므로 append_events(성공 기록)에는 아무것도 쌓이지 않는다.
+        self.assertEqual(adapter._conversation_client.append_events, [])
+
+    def test_ack_idempotency_key_is_stable_across_reclaim(self):
+        """재claim(새 delivery token)돼도 같은 인바운드 event_id면 같은 ack
+        idempotency_key/event_id가 나와야 서버 ledger dedupe가 "자동 1회"를
+        보장한다."""
+        from plugins.platforms.queue.adapter import _ConversationTurn
+
+        claim = self.make_claim()
+        adapter = self.make_v2_adapter(claim)
+        event, _directory = _conversation_fixture()
+        lease = datetime.now(timezone.utc) + timedelta(seconds=600)
+        turn_first_claim = _ConversationTurn(
+            event=event,
+            event_id=event["event_id"],
+            conversation_id=event["conversation_id"],
+            target_agent_id="chami",
+            worker=adapter._worker,
+            active_delivery_token="delivery-token-1",
+            lease_expires_at=lease,
+        )
+        turn_after_reclaim = _ConversationTurn(
+            event=event,
+            event_id=event["event_id"],
+            conversation_id=event["conversation_id"],
+            target_agent_id="chami",
+            worker=adapter._worker,
+            active_delivery_token="delivery-token-2",
+            lease_expires_at=lease,
+        )
+
+        key_first = f"queue_ack:{adapter._agent}:{turn_first_claim.event_id}"
+        key_second = f"queue_ack:{adapter._agent}:{turn_after_reclaim.event_id}"
+        self.assertEqual(key_first, key_second)
+
+        event_first = adapter._build_producer_event(
+            turn_first_claim, event_type="ack", body="ack", idempotency_key=key_first
+        )
+        event_second = adapter._build_producer_event(
+            turn_after_reclaim, event_type="ack", body="ack", idempotency_key=key_second
+        )
+        self.assertEqual(event_first["event_id"], event_second["event_id"])
+        self.assertEqual(
+            event_first["idempotency_key"], event_second["idempotency_key"]
+        )
 
     def test_claim_dispatches_canonical_event_then_completes(self):
         claim = self.make_claim()
@@ -1221,6 +1338,54 @@ class TestConversationV1Adapter(QueueAdapterTestBase):
         asyncio.run(scenario())
         self.assertEqual(self.advance_states(adapter), ["accepted", "completed"])
         self.assertNotIn(claim["event_id"], adapter._inflight)
+
+    def test_dispatch_carries_canonical_conversation_context_then_resets(self):
+        """C4: 인바운드 canonical 컨텍스트 ContextVar 통로.
+
+        _dispatch_conversation_turn이 handle_message 스코프에
+        HERMES_SESSION_CONVERSATION_ID/_EVENT_ID를 싣어(queue_handoff_tool 등
+        답신 도구가 get_session_env로 부모 conversation을 승계할 수 있게) 하고,
+        dispatch가 끝나면(같은 폴링 태스크 컨텍스트 안에서) 원상복구돼야 한다.
+        """
+        from gateway.session_context import get_session_env
+
+        # 주변 프로세스 env가 새어 들어와 위양성을 내지 않게 정리(다른 T* 픽스처와
+        # 동일한 위생 패턴).
+        os.environ.pop("HERMES_SESSION_CONVERSATION_ID", None)
+        os.environ.pop("HERMES_SESSION_CONVERSATION_EVENT_ID", None)
+
+        claim = self.make_claim()
+        adapter = self.make_v2_adapter(claim)
+        during_dispatch = {}
+        after_dispatch = {}
+
+        async def capture(event):
+            during_dispatch["conversation_id"] = get_session_env(
+                "HERMES_SESSION_CONVERSATION_ID"
+            )
+            during_dispatch["event_id"] = get_session_env(
+                "HERMES_SESSION_CONVERSATION_EVENT_ID"
+            )
+
+        adapter.handle_message = capture
+
+        async def scenario():
+            self.assertTrue(await adapter._poll_once())
+            # _poll_once()가 리턴한 시점엔 _dispatch_conversation_turn의 finally가
+            # 이미 실행돼 있다 — 같은 폴링 태스크 컨텍스트에서 즉시 확인한다.
+            after_dispatch["conversation_id"] = get_session_env(
+                "HERMES_SESSION_CONVERSATION_ID"
+            )
+            after_dispatch["event_id"] = get_session_env(
+                "HERMES_SESSION_CONVERSATION_EVENT_ID"
+            )
+
+        asyncio.run(scenario())
+
+        self.assertEqual(during_dispatch["conversation_id"], claim["conversation_id"])
+        self.assertEqual(during_dispatch["event_id"], claim["event_id"])
+        self.assertEqual(after_dispatch["conversation_id"], "")
+        self.assertEqual(after_dispatch["event_id"], "")
 
     def test_processing_failure_advances_delivery_to_error(self):
         claim = self.make_claim()
@@ -1271,21 +1436,32 @@ class TestConversationV1Adapter(QueueAdapterTestBase):
                 adapter._message_handler.assert_not_called()
                 self.assertEqual(self.advance_states(adapter), ["error"])
 
-    def test_no_reply_send_checks_context_delivery_token(self):
+    def test_no_reply_send_with_correct_context_token_appends_reply_event(self):
+        """C3: 정상 본문이면 no-op 대신 causation/conversation을 승계한 reply
+        canonical event를 append하고, message_id는 그 event_id가 된다."""
         claim = self.make_claim()
         adapter = self.make_v2_adapter(claim)
         results = []
 
         async def send_from_active_turn(event):
-            results.append(await adapter.send(event.source.chat_id, "표시하지 않을 답"))
+            results.append(await adapter.send(event.source.chat_id, "표시할 정상 답"))
 
         adapter.handle_message = send_from_active_turn
         self.assertTrue(asyncio.run(adapter._poll_once()))
 
         self.assertEqual(len(results), 1)
         self.assertTrue(results[0].success)
-        self.assertEqual(results[0].message_id, "conversation:no-reply")
+        self.assertNotEqual(results[0].message_id, "conversation:no-reply")
         self.assertIsNone(adapter._repo)
+
+        self.assertEqual(self.append_event_types(adapter), ["ack", "reply"])
+        reply_event = adapter._conversation_client.append_events[1]
+        self.assertEqual(reply_event["body"], "표시할 정상 답")
+        self.assertEqual(reply_event["causation_id"], claim["event_id"])
+        self.assertEqual(reply_event["conversation_id"], claim["conversation_id"])
+        self.assertEqual(reply_event["sender_agent_id"], "chami")
+        self.assertEqual(reply_event["target_agent_ids"], ["chadol"])
+        self.assertEqual(results[0].message_id, reply_event["event_id"])
 
     def test_wrong_context_delivery_token_rejects_send(self):
         claim = self.make_claim()
@@ -1307,6 +1483,286 @@ class TestConversationV1Adapter(QueueAdapterTestBase):
         self.assertEqual(len(results), 1)
         self.assertFalse(results[0].success)
         self.assertIn("ownership lost", results[0].error)
+        # 거부된 send는 append_event를 만들지 않는다 — ack만 남아 있어야 한다.
+        self.assertEqual(self.append_event_types(adapter), ["ack"])
+
+    def test_active_turn_send_noise_gated_body_is_not_appended(self):
+        """§4-1: status ping 등 노이즈는 event로 만들지 않는다(ack는 별개 축)."""
+        claim = self.make_claim()
+        adapter = self.make_v2_adapter(claim)
+        results = []
+
+        async def send_noise(event):
+            results.append(
+                await adapter.send(
+                    event.source.chat_id, "⏳ Working — 3 min — iteration 2"
+                )
+            )
+
+        adapter.handle_message = send_noise
+        self.assertTrue(asyncio.run(adapter._poll_once()))
+
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].success)
+        self.assertEqual(results[0].message_id, "conversation:noise-gated")
+        # ack는 여전히 나갔지만(별도 계약) reply는 만들어지지 않았다.
+        self.assertEqual(self.append_event_types(adapter), ["ack"])
+
+    def test_send_without_active_event_id_is_noop_and_appends_nothing(self):
+        """처리완료 후 정리된 뒤의 stray send 등 — 걸어줄 부모 턴이 없다."""
+        from plugins.platforms.queue.adapter import _NO_REPLY_CHANNEL
+
+        claim = self.make_claim()
+        adapter = self.make_v2_adapter(claim)
+
+        result = asyncio.run(adapter.send(_NO_REPLY_CHANNEL, "부모 없는 답"))
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "conversation:no-reply")
+        self.assertEqual(adapter._conversation_client.calls, [])
+        self.assertEqual(adapter._conversation_client.append_events, [])
+
+    def test_reply_append_failure_returns_send_failure(self):
+        """침묵 실패 금지 — reply append 실패는 SendResult(success=False)로
+        가시화돼 코어 FAILURE->delivery error 경로를 타야 한다."""
+        claim = self.make_claim()
+        adapter = self.make_v2_adapter(claim)
+        results = []
+
+        async def send_failing_reply(event):
+            # ack는 accepted 전이 직후(핸들러 호출 전)에 이미 나간 뒤이므로,
+            # 여기서 에러를 주입하면 reply append만 실패한다.
+            adapter._conversation_client.append_event_error = RuntimeError(
+                "ledger unavailable"
+            )
+            results.append(await adapter.send(event.source.chat_id, "정상 응답"))
+
+        adapter.handle_message = send_failing_reply
+        self.assertTrue(asyncio.run(adapter._poll_once()))
+
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0].success)
+        self.assertIn("conversation reply append failed", results[0].error)
+        # ack 하나만 성공 기록에 남아 있어야 한다(reply는 실패해 안 쌓임).
+        self.assertEqual(self.append_event_types(adapter), ["ack"])
+
+    def test_reply_idempotency_key_stable_for_same_body_differs_for_other_body(self):
+        claim = self.make_claim()
+        adapter = self.make_v2_adapter(claim)
+        results = []
+
+        async def send_three_times(event):
+            results.append(await adapter.send(event.source.chat_id, "같은 본문"))
+            results.append(await adapter.send(event.source.chat_id, "같은 본문"))
+            results.append(await adapter.send(event.source.chat_id, "다른 본문"))
+
+        adapter.handle_message = send_three_times
+        self.assertTrue(asyncio.run(adapter._poll_once()))
+
+        for result in results:
+            self.assertTrue(result.success)
+        reply_events = [
+            event
+            for event in adapter._conversation_client.append_events
+            if event["event_type"] == "reply"
+        ]
+        self.assertEqual(len(reply_events), 3)
+        self.assertEqual(
+            reply_events[0]["idempotency_key"], reply_events[1]["idempotency_key"]
+        )
+        self.assertEqual(reply_events[0]["event_id"], reply_events[1]["event_id"])
+        self.assertNotEqual(
+            reply_events[0]["idempotency_key"], reply_events[2]["idempotency_key"]
+        )
+        self.assertNotEqual(reply_events[0]["event_id"], reply_events[2]["event_id"])
+
+    def test_ack_and_reply_events_match_31_field_canonical_schema(self):
+        """ack·reply producer event 모두 31필드 required 집합과 정확히 일치하고
+        실제 conversation-event.schema.json 검증(additionalProperties:false,
+        body minLength 1 포함)을 통과해야 한다."""
+        import json as _json
+
+        from bridge.conversation_contracts import validate_event_schema
+
+        contracts_dir = Path(SLACK_AGENT_ROOT) / "contracts"
+        schema = _json.loads(
+            (contracts_dir / "conversation-event.schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        required_fields = set(schema["required"])
+        self.assertEqual(len(required_fields), 31)
+
+        claim = self.make_claim()
+        adapter = self.make_v2_adapter(claim)
+        results = []
+
+        async def send_from_active_turn(event):
+            results.append(await adapter.send(event.source.chat_id, "스키마 검증용 본문"))
+
+        adapter.handle_message = send_from_active_turn
+        self.assertTrue(asyncio.run(adapter._poll_once()))
+        self.assertTrue(results[0].success)
+
+        ack_event, reply_event = adapter._conversation_client.append_events
+        for event in (ack_event, reply_event):
+            self.assertEqual(set(event.keys()), required_fields)
+            self.assertGreaterEqual(len(event["body"]), 1)
+            validate_event_schema(event, contracts_dir)  # additionalProperties/enum 등 실검증
+
+    # ---- F1: 인바운드 event_type 게이팅 — 무한 ack 핑퐁 차단 ----------------
+
+    def test_inbound_ack_event_type_is_consumed_without_ack_or_dispatch(self):
+        """claim한 delivery의 event_type이 'ack'면 _send_ack도, 코어 dispatch도
+        하지 않고 claimed→accepted→completed로 조용히 소비해야 한다 — 그러지
+        않으면 두 v2 어댑터 간 ack가 서로 ack를 낳는 무한 핑퐁이 된다."""
+        canonical, _directory = _conversation_fixture()
+        event = copy.deepcopy(canonical)
+        event["event_type"] = "ack"
+        claim = self.make_claim(event=event)
+        adapter = self.make_v2_adapter(claim)
+        adapter._message_handler = MagicMock()
+
+        self.assertTrue(asyncio.run(adapter._poll_once()))
+
+        adapter._message_handler.assert_not_called()
+        self.assertEqual(self.advance_states(adapter), ["accepted", "completed"])
+        # ack event 자체가 append 되지 않는다(_send_ack 미호출) — 무 dispatch.
+        self.assertEqual(adapter._conversation_client.append_events, [])
+
+    def test_inbound_completed_event_type_is_consumed_without_ack_or_dispatch(self):
+        """event_type='completed'도 마찬가지로 관측 전용 — ack/dispatch 없음."""
+        canonical, _directory = _conversation_fixture()
+        event = copy.deepcopy(canonical)
+        event["event_type"] = "completed"
+        claim = self.make_claim(event=event)
+        adapter = self.make_v2_adapter(claim)
+        adapter._message_handler = MagicMock()
+
+        self.assertTrue(asyncio.run(adapter._poll_once()))
+
+        adapter._message_handler.assert_not_called()
+        self.assertEqual(self.advance_states(adapter), ["accepted", "completed"])
+        self.assertEqual(adapter._conversation_client.append_events, [])
+
+    def test_inbound_request_event_type_still_gets_ack_and_dispatch(self):
+        """회귀 가드: event_type='request'(기본 fixture)는 기존 흐름 그대로
+        accepted -> ack -> dispatch가 유지돼야 한다."""
+        claim = self.make_claim()  # 기본 fixture event_type == "request"
+        adapter = self.make_v2_adapter(claim)
+        captured = []
+
+        async def capture(event):
+            captured.append(event)
+
+        adapter.handle_message = capture
+        self.assertTrue(asyncio.run(adapter._poll_once()))
+
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(self.append_event_types(adapter), ["ack"])
+
+    # ---- F2: drain 경로 follow-up 답변 침묵 소실 방지(최소수리: clear 생략) ---
+
+    def test_stray_send_within_same_completion_context_fails_visibly(self):
+        """A(현재 턴)의 on_processing_complete가 실행되는 시점엔 아직
+        _dispatch_conversation_turn의 finally가 돌지 않아 ContextVar가 여전히
+        A의 event_id다 — 코어가 스폰하는 drain task가 이 컨텍스트를 상속하는
+        것과 동일 조건이다. 이 훅이 ContextVar를 clear해버리면(버그) 그 뒤
+        같은 컨텍스트의 send는 '부모 턴 없음'으로 오인해 조용한 성공(no-op)이
+        되고 B의 최종 답이 통째로 소실된다 — clear를 생략해 명시적 실패로
+        가시화해야 한다(SendResult False, append_event 미호출)."""
+        claim = self.make_claim()
+        adapter = self.make_v2_adapter(claim)
+        results = []
+
+        async def handle_then_stray_send(event):
+            await adapter.on_processing_complete(event, self.outcome("SUCCESS"))
+            results.append(
+                await adapter.send(event.source.chat_id, "완료 뒤 stray 답")
+            )
+
+        adapter.handle_message = handle_then_stray_send
+        self.assertTrue(asyncio.run(adapter._poll_once()))
+
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0].success)
+        self.assertIn("ownership lost", results[0].error)
+        # ack만 append 됐고, stray send는 append_event를 만들지 않는다.
+        self.assertEqual(self.append_event_types(adapter), ["ack"])
+
+    # ---- F3: producer event byte 안정성(created_at 고정) — dedupe 전제 -------
+
+    def test_build_producer_event_created_at_is_byte_stable_for_ack_and_reply(self):
+        """서버 dedupe는 같은 idempotency_key에 대해 event 전체가
+        byte-identical해야 duplicate로 흡수한다. created_at을 매번 now()로
+        새로 찍으면 재claim/재빌드 시 payload가 달라져 collision(영구 error)
+        이 난다 — turn.event의 created_at을 승계해야 한다."""
+        from plugins.platforms.queue.adapter import _ConversationTurn
+
+        claim = self.make_claim()
+        adapter = self.make_v2_adapter(claim)
+        event, _directory = _conversation_fixture()
+        lease = datetime.now(timezone.utc) + timedelta(seconds=600)
+        turn = _ConversationTurn(
+            event=event,
+            event_id=event["event_id"],
+            conversation_id=event["conversation_id"],
+            target_agent_id="chami",
+            worker=adapter._worker,
+            active_delivery_token="delivery-token-1",
+            lease_expires_at=lease,
+        )
+
+        for event_type, body in (("ack", "ack"), ("reply", "본문 재현성 확인")):
+            with self.subTest(event_type=event_type):
+                key = f"stable-key-{event_type}"
+                first = adapter._build_producer_event(
+                    turn, event_type=event_type, body=body, idempotency_key=key
+                )
+                second = adapter._build_producer_event(
+                    turn, event_type=event_type, body=body, idempotency_key=key
+                )
+                self.assertEqual(first, second)
+                # now() 재생성 금지 — 인바운드 event의 created_at을 그대로 승계.
+                self.assertEqual(first["created_at"], event["created_at"])
+
+    # ---- F5: producer 노이즈 게이트 — 첫 줄 prefix만(substring-anywhere 금지) --
+
+    def test_producer_noise_gate_uses_first_line_prefix_only_not_substring(self):
+        """'Codex gpt-'가 본문 중간에 있는 진짜 답변까지 소멸시키면 안 된다.
+        status ping류(⏳/◐ 접두)만 첫 줄 prefix로 게이팅한다."""
+        claim = self.make_claim()
+        adapter = self.make_v2_adapter(claim)
+        results = []
+
+        async def send_various(event):
+            results.append(
+                await adapter.send(
+                    event.source.chat_id, "지금 Codex gpt-5 계열로 라우팅 중이야"
+                )
+            )
+            results.append(
+                await adapter.send(event.source.chat_id, "⏳ Working — 3 min")
+            )
+            results.append(
+                await adapter.send(
+                    event.source.chat_id, "◐ Session automatically reset"
+                )
+            )
+
+        adapter.handle_message = send_various
+        self.assertTrue(asyncio.run(adapter._poll_once()))
+
+        # 진짜 답변은 게이팅되지 않고 reply event로 append된다.
+        self.assertTrue(results[0].success)
+        self.assertNotEqual(results[0].message_id, "conversation:noise-gated")
+        # status ping류는 첫 줄 prefix로 게이팅된다.
+        self.assertTrue(results[1].success)
+        self.assertEqual(results[1].message_id, "conversation:noise-gated")
+        self.assertTrue(results[2].success)
+        self.assertEqual(results[2].message_id, "conversation:noise-gated")
+
+        self.assertEqual(self.append_event_types(adapter), ["ack", "reply"])
 
     def test_invalid_claim_target_does_not_attempt_error_transition(self):
         claim = self.make_claim()

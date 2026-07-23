@@ -21,6 +21,7 @@ QUEUE_ENDPOINT와 별도 per-agent QUEUE_CONVERSATION_CREDENTIAL을 필수로 �
 
 import asyncio
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -40,6 +41,7 @@ from gateway.platforms.base import (
     SendResult,
 )
 from gateway.config import Platform, PlatformConfig
+from gateway.session_context import reset_conversation_context, set_conversation_context
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +56,44 @@ MIN_POLL_INTERVAL_SECONDS = 0.2
 _LEGACY_PROTOCOL = "queue.v1"
 _CONVERSATION_PROTOCOL = "conversation.v1"
 _SUPPORTED_PROTOCOLS = {_LEGACY_PROTOCOL, _CONVERSATION_PROTOCOL}
+# canonical event의 delivery_status 유효집합(schema enum과 동일) — append_event
+# 영수증이 이 밖의 값을 반환하면 서버/스키마 드리프트로 보고 실패 처리한다.
+_DELIVERY_STATES = {"pending", "claimed", "accepted", "completed", "error"}
+# F1: claim된 canonical event 중 실제로 코어 dispatch(+ack)를 받을 event_type만
+# 화이트리스트한다. 그 외(ack/progress/reply/completed/failed/no_action/
+# opened/permission_requested/permission_resolved 등)는 서버가 인바운드
+# delivery row도 만드는 관측(observability) 전용 신호다 — 여기에 무조건 ack를
+# 걸고 코어로도 넘기면, 서로 ack를 주고받는 두 v2 어댑터 사이에 ack→ack→ack…
+# 무한 핑퐁이 생긴다(request 1건이 6홉까지 증식 재현). 에이전트에게 이런 신호를
+# 어떻게 보여줄지(가시화)는 P2 설계 — 지금은 ledger·projector가 관측을 담당하고
+# 여기선 claimed→accepted→completed로 조용히 삼킨다(ack 없음, dispatch 없음).
+_ACTIONABLE_EVENT_TYPES = frozenset({"request", "question"})
+# ack/reply producer event의 capability 필드 — tools/queue_handoff_tool.py의
+# 아웃바운드 handoff와 동일 값을 써서 두 producer가 같은 계약을 공유함을 표시한다.
+_PRODUCER_CAPABILITY = "queue_handoff"
+
+# F5: producer(어댑터) 노이즈 게이트 — bridge.conversation_render.is_system_noise
+# 를 그대로 재사용하지 않는다. 그쪽은 substring-anywhere 판정(예: 'Codex gpt-',
+# 'caps context at' 이 본문 어디에 있든 매치)이라 모델 얘기를 하는 *진짜 답변*
+# ('지금 Codex gpt-5 계열로 라우팅 중이야')까지 event 자체를 소멸시킨다 — 표시측
+# (renderer) 오탐 강등과 달리 여기서 오탐은 데이터 손실이다. 그래서 producer
+# 게이트는 첫 줄 prefix만 보는 고정밀 판정으로 좁힌다. 광범위한 노이즈 강등은
+# 표시측(renderer) 소관(§6-2).
+_PRODUCER_NOISE_PREFIXES = ("⏳", ":hourglass", "Working —", "◐ ")
+
+
+def _is_producer_noise(text: str) -> bool:
+    """producer가 event 자체를 만들지 말지 판정 — 첫 줄 prefix 판정만 한다.
+
+    substring-anywhere 판정과 달리 오탐이 실답변 소멸로 이어지지 않는다 —
+    status ping은 실제로 그 문구로 "시작"하지, 본문 중간에 우연히 섞이지
+    않는다는 전제다.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    first_line = stripped.splitlines()[0]
+    return first_line.startswith(_PRODUCER_NOISE_PREFIXES)
 
 # send() 라우팅 접두 규약.
 #   "queue:<slack채널>"  → 자동 응답(코어가 인바운드 턴에 답) → slack_outbox.
@@ -476,6 +516,116 @@ class QueueAdapter(BasePlatformAdapter):
             raise RuntimeError("conversation API returned a non-object result")
         return result
 
+    def _own_trust_tier(self, fallback: str) -> str:
+        """Agent Directory에서 자기(self._agent) 레코드의 trust_tier를 조회한다.
+
+        디렉터리는 connect()에서 스키마·의미 검증을 이미 거쳤으므로 정상 경로에선
+        반드시 self._agent 레코드가 있다. 그래도 조회 실패(테스트 fixture가 빈
+        디렉터리를 주입하는 경우 등)엔 인바운드 event의 trust_tier로 폴백해
+        producer event 생성 자체가 막히지 않게 한다.
+        """
+        directory = self._conversation_directory
+        agents = directory.get("agents") if isinstance(directory, Mapping) else None
+        if isinstance(agents, list):
+            for agent in agents:
+                if isinstance(agent, Mapping) and agent.get("agent_id") == self._agent:
+                    tier = agent.get("trust_tier")
+                    if tier:
+                        return str(tier)
+        return fallback
+
+    def _build_producer_event(
+        self,
+        turn: _ConversationTurn,
+        *,
+        event_type: str,
+        body: str,
+        idempotency_key: str,
+    ) -> dict:
+        """인바운드 turn.event에서 승계해 ack/reply canonical event를 만든다.
+
+        tools/queue_handoff_tool.py:_build_conversation_event와 동일한 event_id
+        파생(qh_evt_{sha256(idempotency_key)[:32]})과 31필드 schema를 쓴다 — 서버
+        ledger가 handoff 도구의 아웃바운드 event와 여기 producer event를 구분하지
+        않고 같은 schema로 검증하기 때문이다.
+
+        F3(byte-stability): ``created_at``은 인바운드 ``turn.event["created_at"]``
+        을 그대로 승계한다(없을 때만 now() 폴백) — 매번 새로 찍으면 안 된다.
+        서버 dedupe는 같은 idempotency_key에 대해 payload_hash(event 전체 직렬화)
+        가 동일해야만 duplicate로 흡수하고, 다르면 ValueError('idempotency
+        collision')로 영구 error가 된다. reclaim 뒤 같은 turn으로 이 함수를 다시
+        불러 재전송할 때 event가 byte-identical해야 그 dedupe가 성립한다 — 이
+        전제가 깨지면(예: LLM이 본문을 재생성해 body 자체가 달라지는 크래시
+        -재생성 케이스) 여전히 collision이 날 수 있다(그 잔여 케이스는 P2
+        receipt-store 검토 대상).
+        """
+        inbound = turn.event
+        workspace_key = str(inbound.get("workspace_key") or "internal")
+        channel_scope = str(
+            inbound.get("channel_scope") or f"queue:{turn.conversation_id}"
+        )
+        correlation_id = str(inbound.get("correlation_id") or turn.conversation_id)
+        sender = str(inbound.get("sender_agent_id") or "")
+        trust_tier = self._own_trust_tier(str(inbound.get("trust_tier") or ""))
+        key_digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+        event_id = f"qh_evt_{key_digest[:32]}"
+        summary = " ".join(body.split())[:200] or event_type
+        return {
+            "contract_version": "1.0",
+            "conversation_id": turn.conversation_id,
+            "source_conversation_id": None,
+            "workspace_key": workspace_key,
+            "slack_team_id": None,
+            "slack_enterprise_id": None,
+            "channel_scope": channel_scope,
+            "event_id": event_id,
+            "event_type": event_type,
+            "sender_agent_id": self._agent,
+            "target_agent_ids": [sender],
+            "correlation_id": correlation_id,
+            "causation_id": turn.event_id,
+            "idempotency_key": idempotency_key,
+            "body": body,
+            "summary": summary,
+            "delivery_status": "pending",
+            "slack_channel_id": None,
+            "slack_thread_ts": None,
+            "slack_message_ts": None,
+            "slack_app_id": None,
+            "slack_bot_user_id": None,
+            "slack_bot_id": None,
+            "slack_installation_id": None,
+            "publisher_agent_id": None,
+            "source_event_id": f"queue:{event_id}",
+            "projected_by": "not_projected",
+            "protocol_version": _CONVERSATION_PROTOCOL,
+            "capability": _PRODUCER_CAPABILITY,
+            "trust_tier": trust_tier,
+            "created_at": str(
+                inbound.get("created_at") or datetime.now(timezone.utc).isoformat()
+            ),
+        }
+
+    async def _send_ack(self, turn: _ConversationTurn) -> None:
+        """인바운드 수신 시 ack event를 자동 1회 append한다(§4-1 ACK 계약).
+
+        idempotency_key를 turn.event_id에서 안정적으로 파생시켜(재claim/재수신
+        때도 동일) 서버 ledger의 idempotency dedupe가 "자동 1회"를 보장한다 —
+        같은 키로 두 번 append해도 동일 payload면 ledger가 중복으로 흡수한다.
+        fail-soft: ack 실패가 턴 처리 자체를 막으면 안 되므로 예외는 warning
+        로그만 남기고 삼킨다(dispatch는 이어서 계속된다).
+        """
+        idempotency_key = f"queue_ack:{self._agent}:{turn.event_id}"
+        event = self._build_producer_event(
+            turn, event_type="ack", body="ack", idempotency_key=idempotency_key
+        )
+        try:
+            await self._conversation_call("append_event", {"event": event})
+        except Exception as exc:  # noqa: BLE001 — ack는 fail-soft, 턴 처리는 계속
+            logger.warning(
+                "[Queue] Ack append failed (event=%s): %s", turn.event_id, exc
+            )
+
     async def _poll_conversation_once(self) -> bool:
         """canonical delivery 하나를 claim하고 accepted 뒤 코어로 인계한다."""
         claim = await self._conversation_call(
@@ -511,6 +661,37 @@ class QueueAdapter(BasePlatformAdapter):
                 exc,
             )
             return True
+
+        event_type = str(turn.event.get("event_type") or "")
+        if event_type not in _ACTIONABLE_EVENT_TYPES:
+            # F1: ack/progress/reply/completed/failed/no_action/opened/
+            # permission_* 등 observability 전용 event — ack도 걸지 않고 코어로도
+            # 넘기지 않는다(무한 ack 핑퐁 차단). 조용히 claimed→accepted→completed
+            # 로만 소비한다.
+            logger.info(
+                "[Queue] Consuming observability event without ack/dispatch "
+                "(event=%s, event_type=%s)",
+                turn.event_id,
+                event_type,
+            )
+            try:
+                await self._advance_conversation_delivery(
+                    turn,
+                    expected_state="accepted",
+                    next_state="completed",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[Queue] Conversation observability-event completion fenced "
+                    "(event=%s): %s",
+                    turn.event_id,
+                    exc,
+                )
+            return True
+
+        # accepted 전이 성공 직후·코어 인계 전 — ack는 fail-soft라 실패해도
+        # 아래 dispatch는 계속된다(_send_ack 내부에서 예외를 삼킴).
+        await self._send_ack(turn)
 
         try:
             await self._dispatch_conversation_turn(turn)
@@ -705,12 +886,20 @@ class QueueAdapter(BasePlatformAdapter):
         delivery_token = _ACTIVE_QUEUE_DELIVERY_TOKEN.set(
             turn.active_delivery_token
         )
+        # canonical conversation_id/event_id를 task-local로 실어 handle_message가
+        # 스폰하는 백그라운드 태스크가 상속하게 한다. 답신 handoff 도구가
+        # get_session_env(HERMES_SESSION_CONVERSATION_ID/_EVENT_ID)로 읽어
+        # 부모 conversation을 승계한다(계약 배경: docs 큐 conversation.v1 C4).
+        conversation_tokens = set_conversation_context(
+            turn.conversation_id, turn.event_id
+        )
         try:
             await self.handle_message(event)
         except BaseException:
             self._inflight.pop(turn.event_id, None)
             raise
         finally:
+            reset_conversation_context(conversation_tokens)
             _ACTIVE_QUEUE_DELIVERY_TOKEN.reset(delivery_token)
             _ACTIVE_QUEUE_EVENT_ID.reset(event_token)
 
@@ -924,9 +1113,22 @@ class QueueAdapter(BasePlatformAdapter):
                     expected_state="accepted",
                     next_state=next_state,
                 )
-                if _ACTIVE_QUEUE_EVENT_ID.get() == event_id:
-                    _ACTIVE_QUEUE_EVENT_ID.set(None)
-                    _ACTIVE_QUEUE_DELIVERY_TOKEN.set(None)
+                # F2(의도적으로 ContextVar를 여기서 clear하지 않는다): 이 훅은
+                # 코어가 스폰한 백그라운드 태스크(A) 안에서 실행된다. 같은
+                # 대화의 후속 턴(B)이 core의 _pending_messages로 큐잉돼 있으면,
+                # B를 처리하는 drain task는 스폰 시점에 A의 이 태스크 컨텍스트를
+                # 그대로 상속한다(ContextVar는 Task 생성 시점 스냅샷). 여기서
+                # _ACTIVE_QUEUE_EVENT_ID/_ACTIVE_QUEUE_DELIVERY_TOKEN을
+                # set(None)하면 drain task도 그 None을 상속하고, B가 보낼 최종
+                # 응답의 send()는 "부모 턴 없음"으로 오인해 조용한 success
+                # no-op이 된다 — B의 답이 delivery는 completed인데 내용만
+                # 통째로 소실되는 침묵 실패(관측 불가)다.
+                # clear를 생략하면 drain task는 대신 A의 (이미 _inflight에서
+                # pop된) stale event_id/token을 그대로 들고 있어, B의 send()
+                # fence(_is_active_message_id → _inflight 조회 실패)가 명시적으로
+                # 걸려 SendResult(success=False, "ownership lost")가 되고 B의
+                # delivery도 error로 가시화된다 — 침묵 소실보다 에러 가시화가
+                # 낫다는 최소 수리다. 근본 수리(턴별 컨텍스트 재바인딩)는 P2.
             except Exception as exc:
                 logger.warning(
                     "[Queue] Conversation completion fenced "
@@ -1000,13 +1202,18 @@ class QueueAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """큐로 메시지를 보낸다 — chat_id 접두로 두 경로 분기(_route_and_insert).
+        """큐로 메시지를 보낸다.
 
+        queue.v1: chat_id 접두로 두 경로 분기(_route_and_insert).
         - 'queue:<채널>'  → 자동 응답: slack_outbox INSERT(발신은 브리지 센더).
         - 그 외(에이전트) → 아웃바운드 handoff: 상대 target의 slack_inbox INSERT.
-
         thread_ts는 코어가 넣어주는 metadata["thread_id"](= source.thread_id)
         우선, 없으면 reply_to(트리거 메시지 ts)로 폴백한다.
+
+        conversation.v1(C3): 활성 인바운드 턴 중의 코어 최종 응답을 자동 `reply`
+        canonical event로 append한다(§4-1) — 노이즈(status ping 등)는 게이팅해
+        event를 만들지 않는다. one-way라 chat_id는 항상 _NO_REPLY_CHANNEL이어야
+        하고, 그 외 target은 여전히 거부(명시적 역방향은 queue_handoff 도구).
         """
         active_event_id = _ACTIVE_QUEUE_EVENT_ID.get()
         if self._protocol_version == _CONVERSATION_PROTOCOL:
@@ -1018,17 +1225,75 @@ class QueueAdapter(BasePlatformAdapter):
                         "for an explicit reverse handoff"
                     ),
                 )
-            if active_event_id and not await self._is_active_message_id(active_event_id):
+            if not active_event_id:
+                # 처리 완료 후 in-flight 정리가 끝난 뒤의 stray send 등 — reply를
+                # 걸어줄 부모 턴이 없으므로 기존대로 no-op 성공.
+                return SendResult(
+                    success=True,
+                    message_id="conversation:no-reply",
+                )
+            if not await self._is_active_message_id(active_event_id):
                 return SendResult(
                     success=False,
                     error="queue turn ownership lost before send",
                 )
-            # 코어의 일반 최종 응답은 v2 ledger/Slack outbox에 투영하지 않는다.
-            # 명시적인 역방향 queue_handoff만 별도 canonical event를 만든다.
-            return SendResult(
-                success=True,
-                message_id="conversation:no-reply",
+            # fence(_is_active_message_id)가 이미 _inflight[active_event_id]가 이
+            # ContextVar 턴과 동일 객체임을 검증했다 — 코어의 최종 응답을 부모
+            # 인바운드 event에 causation으로 잇는 자동 reply event로 투영한다
+            # (§4-1). 노이즈(status ping 등)는 event로 만들지 않고 조용히
+            # no-op 처리한다.
+            turn = self._inflight.get(active_event_id)
+            if not isinstance(turn, _ConversationTurn):
+                # 정상 경로에서는 도달하지 않는다(위 fence가 이미 보장) — 방어적
+                # no-op.
+                return SendResult(
+                    success=True,
+                    message_id="conversation:no-reply",
+                )
+            if _is_producer_noise(content):
+                return SendResult(
+                    success=True,
+                    message_id="conversation:noise-gated",
+                )
+            content_digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            idempotency_key = (
+                f"queue_reply:{self._agent}:{turn.event_id}:{content_digest[:16]}"
             )
+            reply_event = self._build_producer_event(
+                turn,
+                event_type="reply",
+                body=content,
+                idempotency_key=idempotency_key,
+            )
+            try:
+                receipt = await self._conversation_call(
+                    "append_event", {"event": reply_event}
+                )
+            except Exception as exc:
+                # 침묵 실패 금지 — 실패를 가시화해 코어 FAILURE로 넘기고
+                # reclaim/재시도 경로가 이어받게 한다.
+                return SendResult(
+                    success=False,
+                    error=f"conversation reply append failed: {str(exc)[:500]}",
+                )
+            if (
+                not isinstance(receipt, Mapping)
+                or receipt.get("event_id") != reply_event["event_id"]
+            ):
+                return SendResult(
+                    success=False,
+                    error="conversation reply receipt event identity mismatch",
+                )
+            status = str(receipt.get("delivery_status") or "")
+            if status not in _DELIVERY_STATES:
+                return SendResult(
+                    success=False,
+                    error=(
+                        "conversation reply receipt has an invalid "
+                        f"delivery_status: {status!r}"
+                    ),
+                )
+            return SendResult(success=True, message_id=reply_event["event_id"])
 
         if self._repo is None:
             return SendResult(success=False, error="queue repo not connected")

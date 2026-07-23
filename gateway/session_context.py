@@ -34,6 +34,14 @@ needs to replace the import + call site:
     # after
     from gateway.session_context import get_session_env
     platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+
+**canonical conversation 승계 통로**
+
+``HERMES_SESSION_CONVERSATION_ID``/``HERMES_SESSION_CONVERSATION_EVENT_ID``는
+conversation.v1 인바운드 턴의 부모 conversation_id/event_id를 나르는 전용
+통로다. 큐 어댑터(``plugins/platforms/queue/adapter.py``)가
+``set_conversation_context``로 dispatch 스코프에 싣고, 답신 handoff 도구가
+``get_session_env``로 읽어 답신이 같은 conversation을 승계하게 한다.
 """
 
 from contextvars import ContextVar
@@ -61,6 +69,18 @@ _SESSION_ID: ContextVar = ContextVar("HERMES_SESSION_ID", default=_UNSET)
 # so background-process notifications stay inside the originating Telegram
 # private-chat topic (those lanes route only with thread id + reply anchor).
 _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", default=_UNSET)
+
+# canonical conversation.v1 인바운드 턴의 승계 통로. 큐 어댑터의
+# ``_dispatch_conversation_turn``이 dispatch 스코프에서 set하고, 답신
+# handoff 도구(``queue_handoff_tool``)가 ``get_session_env``로 읽어 부모
+# conversation_id/event_id를 이어받는다. task-local이라 동시에 여러 턴이
+# dispatch돼도 서로의 conversation 식별자를 덮어쓰지 않는다.
+_SESSION_CONVERSATION_ID: ContextVar = ContextVar(
+    "HERMES_SESSION_CONVERSATION_ID", default=_UNSET
+)
+_SESSION_CONVERSATION_EVENT_ID: ContextVar = ContextVar(
+    "HERMES_SESSION_CONVERSATION_EVENT_ID", default=_UNSET
+)
 
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
@@ -100,6 +120,8 @@ _VAR_MAP = {
     "HERMES_SESSION_KEY": _SESSION_KEY,
     "HERMES_SESSION_ID": _SESSION_ID,
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
+    "HERMES_SESSION_CONVERSATION_ID": _SESSION_CONVERSATION_ID,
+    "HERMES_SESSION_CONVERSATION_EVENT_ID": _SESSION_CONVERSATION_EVENT_ID,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
@@ -194,6 +216,8 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_KEY,
         _SESSION_ID,
         _SESSION_MESSAGE_ID,
+        _SESSION_CONVERSATION_ID,
+        _SESSION_CONVERSATION_EVENT_ID,
     ):
         var.set("")
     # Reset async-delivery capability to the "never set" sentinel rather than a
@@ -207,6 +231,40 @@ def clear_session_vars(tokens: list) -> None:
         clear_session_cwd()
     except Exception:
         pass
+
+
+def set_conversation_context(conversation_id: str, event_id: str) -> list:
+    """canonical conversation.v1 턴의 conversation_id/event_id를 현재 컨텍스트에 싣는다.
+
+    ``set_session_vars``/``clear_session_vars`` 쌍과 달리 이 helper는
+    **중첩 안전(nesting-safe)** 하도록 ``var.reset(token)`` 방식으로 설계했다.
+    ``set_session_vars``는 세션 하나가 프로세스 수명 전체에 걸쳐 있다고 가정하고
+    ``clear_session_vars``에서 무조건 ``""``로 되돌리지만, 이 컨텍스트는 큐
+    어댑터의 ``_dispatch_conversation_turn`` 처럼 **더 좁은 스코프**(턴 하나의
+    dispatch) 안에서만 유효해야 한다. 토큰 기반 reset이라야 그 스코프가
+    끝났을 때 정확히 "호출 전 값"(대개 ``_UNSET``, 드물게 바깥 스코프가 이미
+    set해둔 값)으로 복원되고, 동시에 여러 턴이 겹쳐도 서로의 컨텍스트를
+    덮어쓰지 않는다.
+
+    반환된 토큰 리스트는 ``reset_conversation_context``에 그대로 넘겨야 한다.
+    """
+    return [
+        _SESSION_CONVERSATION_ID.set(conversation_id),
+        _SESSION_CONVERSATION_EVENT_ID.set(event_id),
+    ]
+
+
+def reset_conversation_context(tokens: list) -> None:
+    """``set_conversation_context``가 반환한 토큰으로 이전 상태를 복원한다.
+
+    set 순서의 역순(LIFO)으로 reset한다 — 이 두 변수는 서로 독립적이라
+    기능적으로는 순서가 상관없지만, 큐 어댑터의 기존
+    ``_ACTIVE_QUEUE_EVENT_ID``/``_ACTIVE_QUEUE_DELIVERY_TOKEN`` set/reset
+    쌍과 스타일을 맞춘다.
+    """
+    conversation_token, event_token = tokens
+    _SESSION_CONVERSATION_EVENT_ID.reset(event_token)
+    _SESSION_CONVERSATION_ID.reset(conversation_token)
 
 
 def get_session_env(name: str, default: str = "") -> str:

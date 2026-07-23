@@ -86,6 +86,8 @@ class QueueHandoffToolTestBase(unittest.TestCase):
             "HERMES_SESSION_CHAT_ID",
             "HERMES_SESSION_KEY",
             "HERMES_SESSION_MESSAGE_ID",
+            "HERMES_SESSION_CONVERSATION_ID",
+            "HERMES_SESSION_CONVERSATION_EVENT_ID",
             "QUEUE_ENDPOINT",
             "QUEUE_TOKEN",
             "QUEUE_PROTOCOL_VERSION",
@@ -824,6 +826,242 @@ class TestReturnContract(QueueHandoffToolTestBase):
         raw = asyncio.run(queue_handoff_tool({"to": "chami", "message": "self"}))
         self.assertIsInstance(raw, str)
         self.assertIn("error", json.loads(raw))
+
+
+class TestCanonicalEventContract(QueueHandoffToolTestBase):
+    """Phase C1/C2: conversation_id 방향 무관 + 부모 승계 + event_type 파라미터.
+
+    SSOT: slack_agent 계약확정서 D2(대화 정체성은 스레드 1:1, 방향 무관·답신은
+    부모 conversation_id 승계) / D4(종결은 명시 호출, reply는 게이트웨이 자동생성
+    이라 도구 enum에서 제외).
+    """
+
+    def _v2_env(self):
+        return {
+            "QUEUE_PROTOCOL_VERSION": "conversation.v1",
+            "QUEUE_ENDPOINT": "http://127.0.0.1:8770",
+            "QUEUE_CONVERSATION_CREDENTIAL": "private-agent-credential",
+        }
+
+    def _capture_append(self, seen, status="pending"):
+        def append(*args, **kwargs):
+            seen.append(kwargs["event"])
+            return {
+                "receipt": "enqueued",
+                "event_id": kwargs["event"]["event_id"],
+                "delivery_status": status,
+                "inserted": True,
+            }
+
+        return append
+
+    # --- C1: conversation_id는 방향 무관(D2) ---
+
+    def test_conversation_id_is_direction_independent(self):
+        from tools.queue_handoff_tool import (
+            _build_conversation_event,
+            _request_identity,
+        )
+
+        forward = _request_identity(
+            agent="chami",
+            target="chadol",
+            message="정방향 요청",
+            thread_ts="topic-1",
+            source_anchor="",
+        )
+        backward = _request_identity(
+            agent="chadol",
+            target="chami",
+            message="역방향 요청",
+            thread_ts="topic-1",
+            source_anchor="",
+        )
+        forward_event = _build_conversation_event(
+            request=forward, idempotency_key="key-a", sender_trust_tier="internal"
+        )
+        backward_event = _build_conversation_event(
+            request=backward, idempotency_key="key-b", sender_trust_tier="internal"
+        )
+        self.assertEqual(
+            forward_event["conversation_id"], backward_event["conversation_id"]
+        )
+
+    def test_conversation_id_still_varies_by_thread(self):
+        # 회귀 가드: 방향만 무시하고 thread까지 뭉개면 안 된다.
+        from tools.queue_handoff_tool import (
+            _build_conversation_event,
+            _request_identity,
+        )
+
+        topic_a = _request_identity(
+            agent="chami",
+            target="chadol",
+            message="m",
+            thread_ts="topic-a",
+            source_anchor="",
+        )
+        topic_b = _request_identity(
+            agent="chami",
+            target="chadol",
+            message="m",
+            thread_ts="topic-b",
+            source_anchor="",
+        )
+        event_a = _build_conversation_event(
+            request=topic_a, idempotency_key="key-a", sender_trust_tier="internal"
+        )
+        event_b = _build_conversation_event(
+            request=topic_b, idempotency_key="key-b", sender_trust_tier="internal"
+        )
+        self.assertNotEqual(event_a["conversation_id"], event_b["conversation_id"])
+
+    # --- C1: 부모 conversation_id/event_id 승계 ---
+
+    def test_parent_conversation_and_event_id_are_inherited(self):
+        seen = []
+        env = self._v2_env() | {
+            "HERMES_SESSION_CONVERSATION_ID": "qh_conv_parent0000",
+            "HERMES_SESSION_CONVERSATION_EVENT_ID": "qh_evt_parent0000",
+        }
+        with patch.dict(os.environ, env, clear=False), patch(
+            "tools.queue_handoff_tool._do_conversation_append",
+            side_effect=self._capture_append(seen),
+        ):
+            result = self.call_tool(to="chadol", message="답신 위임")
+
+        self.assertTrue(result.get("success"), result)
+        event = seen[0]
+        self.assertEqual(event["conversation_id"], "qh_conv_parent0000")
+        self.assertEqual(event["causation_id"], "qh_evt_parent0000")
+        self.assertEqual(event["correlation_id"], "qh_conv_parent0000")
+        self.assertEqual(event["channel_scope"], "queue:qh_conv_parent0000")
+
+    def test_no_parent_env_falls_back_to_thread_derived_conversation_id(self):
+        seen = []
+        with patch.dict(os.environ, self._v2_env(), clear=False), patch(
+            "tools.queue_handoff_tool._do_conversation_append",
+            side_effect=self._capture_append(seen),
+        ):
+            result = self.call_tool(
+                to="chadol", message="부모 없음", thread="topic-solo"
+            )
+
+        self.assertTrue(result.get("success"), result)
+        self.assertTrue(seen[0]["conversation_id"].startswith("qh_conv_"))
+        self.assertNotEqual(seen[0]["conversation_id"], "qh_conv_parent0000")
+
+    # --- C2: event_type 파라미터 ---
+
+    def test_event_type_explicit_completed_is_reflected_in_event(self):
+        seen = []
+        with patch.dict(os.environ, self._v2_env(), clear=False), patch(
+            "tools.queue_handoff_tool._do_conversation_append",
+            side_effect=self._capture_append(seen, status="completed"),
+        ):
+            result = self.call_tool(
+                to="chadol", message="작업 종결", event_type="completed"
+            )
+
+        self.assertTrue(result.get("success"), result)
+        self.assertEqual(seen[0]["event_type"], "completed")
+
+    def test_event_type_unspecified_defaults_to_request(self):
+        seen = []
+        with patch.dict(os.environ, self._v2_env(), clear=False), patch(
+            "tools.queue_handoff_tool._do_conversation_append",
+            side_effect=self._capture_append(seen),
+        ):
+            result = self.call_tool(to="chadol", message="기본값")
+
+        self.assertTrue(result.get("success"), result)
+        self.assertEqual(seen[0]["event_type"], "request")
+
+    def test_event_type_outside_enum_rejected(self):
+        # dispatch 이전에 거부돼야 한다 — transport 에러로 우연히 통과하는 약한
+        # 검증(append가 실제 호출됐는데 그 실패를 enum 거부로 오인)을 배제한다.
+        with patch.dict(os.environ, self._v2_env(), clear=False), patch(
+            "tools.queue_handoff_tool._do_conversation_append"
+        ) as append:
+            result = self.call_tool(
+                to="chadol", message="허용 밖 event_type", event_type="reply"
+            )
+        self.assertIn("error", result)
+        self.assertNotIn("success", result)
+        self.assertIn("event_type", result.get("error", ""))
+        append.assert_not_called()
+
+    def test_event_type_on_legacy_v1_is_explicitly_rejected_not_silently_ignored(self):
+        # D4: legacy queue.v1엔 canonical event vocabulary가 없다 — 조용히 무시하고
+        # "request"인 척 성공을 돌려주면 안 되고, 명시적으로 거부해야 한다.
+        self.make_repo()
+        result = self.call_tool(
+            to="chadol", message="v1인데 event_type", event_type="completed"
+        )
+        self.assertIn("error", result)
+        self.assertIn("conversation.v1", result.get("error", ""))
+        self.assertEqual(self.inbox_rows(), [])
+
+    def test_schema_declares_event_type_enum_without_reply(self):
+        from tools.queue_handoff_tool import QUEUE_HANDOFF_SCHEMA
+
+        props = QUEUE_HANDOFF_SCHEMA["parameters"]["properties"]
+        self.assertIn("event_type", props)
+        self.assertEqual(
+            set(props["event_type"]["enum"]),
+            {"request", "progress", "question", "completed", "failed", "no_action"},
+        )
+
+    # --- F4: terminal event_type 순서 제약이 스키마 설명에 문서화돼 있어야 한다 ---
+
+    def test_schema_event_type_description_documents_terminal_ordering_constraint(self):
+        """인바운드 턴 중 completed/failed/no_action을 먼저 호출하면 게이트웨이의
+        턴-후 auto-reply가 'already terminal'로 거부된다 — 이 순서 제약이 도구
+        설명에 명문화돼 있어야 에이전트가 실수로 자기 턴의 답을 delivery error로
+        만들지 않는다(Phase C 범위: 문서화만, 동작 변경 없음)."""
+        from tools.queue_handoff_tool import QUEUE_HANDOFF_SCHEMA
+
+        description = QUEUE_HANDOFF_SCHEMA["parameters"]["properties"]["event_type"][
+            "description"
+        ]
+        self.assertIn("terminal", description.lower())
+        self.assertIn("before your final answer", description)
+        self.assertIn("reply", description)
+        self.assertIn("AFTER", description)
+
+    # --- C2: idempotency — event_type만 다르면 키도 달라져야 하되, request는
+    # 명시/미지정 상관없이 기존 해시와 하위호환(구버전 재시도와 계속 일치)돼야 한다.
+
+    def test_event_type_changes_idempotency_key_but_request_is_stable(self):
+        seen = []
+        with patch.dict(os.environ, self._v2_env(), clear=False), patch(
+            "tools.queue_handoff_tool._do_conversation_append",
+            side_effect=self._capture_append(seen),
+        ):
+            explicit_request = self.call_tool(
+                to="chadol",
+                message="동일 인자",
+                thread="topic-same",
+                event_type="request",
+            )
+            default_request = self.call_tool(
+                to="chadol", message="동일 인자", thread="topic-same"
+            )
+            completed = self.call_tool(
+                to="chadol",
+                message="동일 인자",
+                thread="topic-same",
+                event_type="completed",
+            )
+
+        self.assertTrue(explicit_request.get("success"), explicit_request)
+        self.assertTrue(completed.get("success"), completed)
+        self.assertEqual(
+            explicit_request["idempotency_key"], default_request["idempotency_key"]
+        )
+        self.assertNotEqual(
+            explicit_request["idempotency_key"], completed["idempotency_key"]
+        )
 
 
 if __name__ == "__main__":

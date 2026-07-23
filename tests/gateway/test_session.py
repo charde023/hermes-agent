@@ -13,6 +13,14 @@ from gateway.session import (
     build_session_key,
     canonical_whatsapp_identifier,
 )
+from gateway.session_context import (
+    _UNSET,
+    _VAR_MAP,
+    clear_session_vars,
+    get_session_env,
+    reset_conversation_context,
+    set_conversation_context,
+)
 
 # Legacy name preserved for these tests; product renamed the function to
 # canonical_whatsapp_identifier.  Keep the tests referencing the old name
@@ -1648,3 +1656,76 @@ class TestGatewaySessionDbRecovery:
         assert reset.session_id != entry.session_id
         assert reset.was_auto_reset is True
         assert reset.auto_reset_reason == "idle"
+
+
+class TestConversationContextVar:
+    """gateway.session_context.set_conversation_context/reset_conversation_context.
+
+    canonical event 계약 Phase C의 C4 — 인바운드 canonical 컨텍스트 ContextVar
+    통로. 큐 어댑터가 dispatch 스코프에서 set하고, 답신 handoff 도구가
+    get_session_env(HERMES_SESSION_CONVERSATION_ID/_EVENT_ID)로 읽는다.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_contextvars(self):
+        """모든 세션 contextvar을 테스트 간 _UNSET으로 되돌린다.
+
+        pytest는 같은 스레드/컨텍스트를 테스트 함수 사이에 공유하므로, 한
+        테스트에서 set한 값이 리셋되지 않으면 다음 테스트로 샌다.
+        """
+        yield
+        for var in _VAR_MAP.values():
+            var.set(_UNSET)
+
+    def test_set_conversation_context_populates_both_names(self, monkeypatch):
+        monkeypatch.delenv("HERMES_SESSION_CONVERSATION_ID", raising=False)
+        monkeypatch.delenv("HERMES_SESSION_CONVERSATION_EVENT_ID", raising=False)
+
+        tokens = set_conversation_context("conv-123", "evt-456")
+
+        assert get_session_env("HERMES_SESSION_CONVERSATION_ID") == "conv-123"
+        assert get_session_env("HERMES_SESSION_CONVERSATION_EVENT_ID") == "evt-456"
+        assert len(tokens) == 2
+
+    def test_reset_conversation_context_restores_unset_and_falls_back_to_env(
+        self, monkeypatch
+    ):
+        """reset 후에는 _UNSET으로 복원돼 os.environ 폴백이 다시 동작해야 한다."""
+        monkeypatch.setenv("HERMES_SESSION_CONVERSATION_ID", "cli-conv-from-env")
+        monkeypatch.delenv("HERMES_SESSION_CONVERSATION_EVENT_ID", raising=False)
+
+        tokens = set_conversation_context("conv-123", "evt-456")
+        assert get_session_env("HERMES_SESSION_CONVERSATION_ID") == "conv-123"
+
+        reset_conversation_context(tokens)
+
+        assert get_session_env("HERMES_SESSION_CONVERSATION_ID") == "cli-conv-from-env"
+        assert get_session_env("HERMES_SESSION_CONVERSATION_EVENT_ID") == ""
+
+    def test_reset_conversation_context_is_nesting_safe(self, monkeypatch):
+        """두 번 연달아 set/reset해도(연속 두 턴) 서로 값이 새지 않는다."""
+        monkeypatch.delenv("HERMES_SESSION_CONVERSATION_ID", raising=False)
+        monkeypatch.delenv("HERMES_SESSION_CONVERSATION_EVENT_ID", raising=False)
+
+        first_tokens = set_conversation_context("conv-first", "evt-first")
+        assert get_session_env("HERMES_SESSION_CONVERSATION_ID") == "conv-first"
+        reset_conversation_context(first_tokens)
+        assert get_session_env("HERMES_SESSION_CONVERSATION_ID") == ""
+
+        second_tokens = set_conversation_context("conv-second", "evt-second")
+        assert get_session_env("HERMES_SESSION_CONVERSATION_ID") == "conv-second"
+        assert get_session_env("HERMES_SESSION_CONVERSATION_EVENT_ID") == "evt-second"
+        reset_conversation_context(second_tokens)
+        assert get_session_env("HERMES_SESSION_CONVERSATION_ID") == ""
+        assert get_session_env("HERMES_SESSION_CONVERSATION_EVENT_ID") == ""
+
+    def test_clear_session_vars_blocks_stale_conversation_fallback(self, monkeypatch):
+        """세션 종료(clear_session_vars) 후엔 ""로 고정돼 stale 승계가 안 된다."""
+        monkeypatch.setenv("HERMES_SESSION_CONVERSATION_ID", "stale-env-conv")
+        monkeypatch.setenv("HERMES_SESSION_CONVERSATION_EVENT_ID", "stale-env-evt")
+
+        set_conversation_context("conv-123", "evt-456")
+        clear_session_vars([])
+
+        assert get_session_env("HERMES_SESSION_CONVERSATION_ID") == ""
+        assert get_session_env("HERMES_SESSION_CONVERSATION_EVENT_ID") == ""

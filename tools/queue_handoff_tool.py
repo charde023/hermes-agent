@@ -25,6 +25,15 @@ slack_user_id=<발신 에이전트 키>로 박히고,
 수신 에이전트 코어 authz는 default-deny다. 수신측이 자기 QUEUE_ALLOWED_SENDERS에
 발신 키를 넣거나 QUEUE_ALLOW_ALL_USERS를 켜지 않으면 handoff가 "sender not allowed"로
 error 마킹돼 소실된다 — 이 도구가 success를 반환해도 그렇다(인가 우회는 별도 이슈).
+
+⚠️ F4(순서 제약, 문서화만 — 동작 변경 없음): terminal event_type
+(completed/failed/no_action)은 인바운드 conversation.v1 턴이 아직 진행 중일 때
+(= 최종 답을 보내기 전에) 호출하면 안 된다. 게이트웨이는 턴이 끝난 뒤 모델의
+최종 답을 자동으로 ``reply`` canonical event로 append하는데, ledger는 이미
+terminal(DONE)로 닫힌 conversation에 append를 거부한다 — 즉 턴 도중
+completed/failed/no_action을 먼저 호출하면 정상적인 게이트웨이 auto-reply가
+delivery error를 만든다. 종결은 요청자 쪽에서 걸거나, 더 이상 답을 만들지 않는
+턴에서 호출해야 한다(종결 메커니즘 재설계는 P2).
 """
 
 import asyncio
@@ -67,6 +76,20 @@ _TRUST_TIERS = {
     "quarantined",
 }
 _EXECUTION_TRUST_TIERS = {"internal", "trusted", "operator"}
+
+# 도구가 명시적으로 받는 event_type. 전체 canonical 스키마(opened/ack/reply/
+# permission_*)엔 게이트웨이·시스템 전용 값이 더 있지만 그건 여기 노출하지 않는다
+# — reply는 게이트웨이가 본문 답변에서 자동 생성하고, ack/opened/permission_*은
+# 세션 lifecycle 신호라 에이전트가 직접 호출할 이유가 없다(계약 §4-2).
+_EVENT_TYPES = {
+    "request",
+    "progress",
+    "question",
+    "completed",
+    "failed",
+    "no_action",
+}
+_DEFAULT_EVENT_TYPE = "request"
 
 # insert_inbox는 어댑터 send()를 우회하므로 플랫폼 max_message_length(register의
 # 40_000) 가드가 적용되지 않는다 — 여기서 동일 상한을 직접 강제한다.
@@ -395,15 +418,28 @@ def _stable_thread_id(
 
 
 def _request_identity(
-    *, agent: str, target: str, message: str, thread_ts: str, source_anchor: str
+    *,
+    agent: str,
+    target: str,
+    message: str,
+    thread_ts: str,
+    source_anchor: str,
+    event_type: str = _DEFAULT_EVENT_TYPE,
 ) -> dict:
-    return {
+    identity = {
         "sender_agent_id": agent,
         "target_agent_id": target,
         "message": message,
         "thread_ts": thread_ts,
         "source_anchor": source_anchor,
     }
+    # event_type=="request"(기본값)일 땐 키 자체를 넣지 않는다 — 구버전이 발급한
+    # idempotency_key/재시도와 계속 같은 해시를 내야 하기 때문. progress/completed
+    # 등 명시적 값일 때만 해시에 반영해, 같은 to/message/thread라도 event_type이
+    # 다르면 서로 다른 idempotency_key(다른 canonical event)로 갈라지게 한다.
+    if event_type != _DEFAULT_EVENT_TYPE:
+        identity["event_type"] = event_type
+    return identity
 
 
 def _stable_idempotency_key(request: Mapping, explicit: object = None) -> str:
@@ -418,18 +454,34 @@ def _build_conversation_event(
     request: Mapping,
     idempotency_key: str,
     sender_trust_tier: str,
+    event_type: str = _DEFAULT_EVENT_TYPE,
+    parent_conversation_id: str | None = None,
+    parent_event_id: str | None = None,
 ) -> dict:
+    """canonical conversation.v1 이벤트 순수 빌더. 컨텍스트/env는 호출부에서 읽는다.
+
+    D2(계약확정서): 대화 정체성은 스레드 1:1이고 **방향 무관** — sender/target을
+    conversation_id 산식에 넣지 않는다(같은 thread_ts면 A→B든 B→A든 같은
+    conversation). 답신(부모 conversation_id가 있는 인바운드 v2 턴 안의 handoff)은
+    새 conversation_id를 발급하지 않고 부모를 그대로 승계하며, causation_id는
+    부모 event_id를 가리킨다.
+    """
     agent = str(request["sender_agent_id"])
     target = str(request["target_agent_id"])
     thread_ts = str(request["thread_ts"])
     source_anchor = str(request.get("source_anchor") or "")
     message = str(request["message"])
     key_digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
-    conversation_digest = _canonical_hash(
-        {"sender": agent, "target": target, "thread_ts": thread_ts}
-    )
     event_id = f"qh_evt_{key_digest[:32]}"
-    conversation_id = f"qh_conv_{conversation_digest[:32]}"
+
+    if parent_conversation_id:
+        conversation_id = parent_conversation_id
+        causation_id = parent_event_id or (source_anchor or None)
+    else:
+        conversation_digest = _canonical_hash({"thread_ts": thread_ts})
+        conversation_id = f"qh_conv_{conversation_digest[:32]}"
+        causation_id = source_anchor or None
+
     summary = " ".join(message.split())[:200] or "queue handoff request"
     return {
         "contract_version": "1.0",
@@ -440,11 +492,11 @@ def _build_conversation_event(
         "slack_enterprise_id": None,
         "channel_scope": f"queue:{conversation_id}",
         "event_id": event_id,
-        "event_type": "request",
+        "event_type": event_type,
         "sender_agent_id": agent,
         "target_agent_ids": [target],
         "correlation_id": conversation_id,
-        "causation_id": source_anchor or None,
+        "causation_id": causation_id,
         "idempotency_key": idempotency_key,
         "body": message,
         "summary": summary,
@@ -589,6 +641,22 @@ async def queue_handoff_tool(args: dict, **kw) -> str:
     to = (args.get("to") or "").strip()
     message = args.get("message")
 
+    # event_type: conversation.v1 전용 canonical 어휘(계약 §4-2). legacy queue.v1엔
+    # event vocabulary가 없으므로 명시됐는데 v1이면 조용히 무시하지 않고 즉시 거부.
+    event_type_raw = str(args.get("event_type") or "").strip().casefold()
+    if event_type_raw:
+        if protocol != _CONVERSATION_PROTOCOL:
+            return tool_error(
+                "event_type requires conversation.v1; legacy queue.v1 has no "
+                "canonical event vocabulary"
+            )
+        if event_type_raw not in _EVENT_TYPES:
+            return tool_error(
+                f"event_type must be one of {sorted(_EVENT_TYPES)} — got "
+                f"'{event_type_raw}'"
+            )
+    event_type = event_type_raw or _DEFAULT_EVENT_TYPE
+
     # --- 방어(삽입 없이 거부) ---
     if not to:
         return tool_error("empty target")
@@ -644,6 +712,7 @@ async def queue_handoff_tool(args: dict, **kw) -> str:
         message=message,
         thread_ts=thread_ts,
         source_anchor=source_anchor,
+        event_type=event_type,
     )
     try:
         idempotency_key = _stable_idempotency_key(
@@ -656,10 +725,23 @@ async def queue_handoff_tool(args: dict, **kw) -> str:
     try:
         store = await asyncio.to_thread(QueueHandoffReceiptStore)
         if protocol == _CONVERSATION_PROTOCOL:
+            # 답신(인바운드 v2 턴 안에서의 handoff)은 새 conversation_id를 발급하지
+            # 않고 부모 conversation을 그대로 승계한다(D2). 큐 어댑터가
+            # set_conversation_context로 싣고 get_session_env가 os.environ 폴백까지
+            # 포함해 읽는다.
+            parent_conversation_id = (
+                get_session_env("HERMES_SESSION_CONVERSATION_ID", "") or None
+            )
+            parent_event_id = (
+                get_session_env("HERMES_SESSION_CONVERSATION_EVENT_ID", "") or None
+            )
             candidate_event = _build_conversation_event(
                 request=request,
                 idempotency_key=idempotency_key,
                 sender_trust_tier=roster.sender_trust_tier,
+                event_type=event_type,
+                parent_conversation_id=parent_conversation_id,
+                parent_event_id=parent_event_id,
             )
             record, _ = await asyncio.to_thread(
                 store.reserve,
@@ -792,6 +874,33 @@ QUEUE_HANDOFF_SCHEMA = {
                     "Optional stable caller key for handoff retries; the tool derives one "
                     "when omitted. Required for action=receipt. Reusing a key with different "
                     "target/message/thread is rejected as a collision."
+                ),
+            },
+            "event_type": {
+                "type": "string",
+                "enum": [
+                    "request",
+                    "progress",
+                    "question",
+                    "completed",
+                    "failed",
+                    "no_action",
+                ],
+                "description": (
+                    "Optional; default request. Use completed/failed/no_action to "
+                    "explicitly close out a handoff (contract Sec 4-2) — closure is "
+                    "never inferred automatically. The reply event type is generated "
+                    "automatically by the gateway for inline answers and is not "
+                    "exposed here. conversation.v1 only; legacy queue.v1 has no "
+                    "canonical event vocabulary and rejects this field instead of "
+                    "silently ignoring it. IMPORTANT ordering constraint: terminal "
+                    "events (completed/failed/no_action) must not be sent during an "
+                    "active inbound conversation turn before your final answer — the "
+                    "gateway auto-appends your final answer as a `reply` event AFTER "
+                    "the turn, and the ledger rejects appends to an already-terminal "
+                    "conversation. Close from the requester side instead, or only use "
+                    "a terminal event_type in a turn where you produce no further "
+                    "answer."
                 ),
             },
         },
