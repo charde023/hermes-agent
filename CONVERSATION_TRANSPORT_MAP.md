@@ -33,6 +33,18 @@ Slack 멀티 워크스페이스와 Agent Directory 기반 `conversation.v1` 큐 
   private env의 `QUEUE_CONVERSATION_CREDENTIAL`.
 - 공통 home channel은 `home_channel.chat_id` + `home_channel.scope_id` 쌍이다.
 
+## conversation.v1 producer (Phase C, 2026-07-23)
+
+hermes가 canonical event를 생산한다 — 계약 SSOT는 slack_agent `design/2026-07-20_canonical-event_계약확정서.md`.
+
+- **인바운드 게이팅**: `request`/`question`만 ack+코어 dispatch(`_ACTIONABLE_EVENT_TYPES`). 그 외 event_type은 ack·dispatch 없이 `accepted→completed`로 조용히 소비 — 안 하면 두 v2 어댑터 간 **무한 ack 핑퐁**(적대검증 재현 6홉). 에이전트 가시화는 P2.
+- **conversation_id는 방향 무관**(thread 해시)이고, 답신 handoff는 `HERMES_SESSION_CONVERSATION_ID`/`_EVENT_ID` ContextVar(세션 컨텍스트 통로)로 **부모를 승계**한다.
+- **producer event는 byte-stable이 계약**: `created_at`을 인바운드 event에서 승계 — 서버 dedupe가 payload_hash 일치를 요구해, 재빌드가 1바이트라도 다르면 idempotency collision→영구 error가 된다.
+- **producer 노이즈 게이트는 첫줄 prefix만**(`_is_producer_noise`). bridge `is_system_noise`(substring-anywhere)는 표시측 전용 — producer에서 쓰면 진짜 답변이 event째 소멸한다.
+- **같은 턴에서 명시 terminal(completed 등) 금지**: auto-reply가 턴 끝에 발화하므로 terminal 뒤 append 거부에 걸린다(도구 스키마에 명문화). 요청자 종결이 현행 패턴, 종결 메커니즘 재설계는 P2.
+- **drain(follow-up) 턴은 fail-visible**: v2 완료훅은 ContextVar를 클리어하지 않는다 — 클리어하면 후속 턴 답변이 조용히 소실된다(침묵 대신 ownership-lost 에러 가시화). 턴별 컨텍스트 재바인딩은 P2.
+- **v2 전환 스위치** = 프로필 `.env` 3키(`QUEUE_PROTOCOL_VERSION`·`QUEUE_ENDPOINT`·`QUEUE_CONVERSATION_CREDENTIAL`) + `launchctl kickstart -k`(plist 무수정·bootout 불필요). ⚠️전환 즉시 옛 pending delivery를 claim하므로 **전환 전 stale delivery drain 필수**.
+
 ## ★ 음성지식·함정
 
 - 한 Socket Mode app-level token은 같은 앱의 여러 설치를 받을 수 있다. bot token과 bot/user ID는 워크스페이스별이다.
