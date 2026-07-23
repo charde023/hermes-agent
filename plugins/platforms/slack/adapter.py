@@ -693,9 +693,11 @@ class SlackAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
 
-    def _status_mark_inbound(self, team_id: str) -> None:
+    def _status_mark_inbound(
+        self, team_id: str, channel_id: Optional[str] = None
+    ) -> None:
         try:
-            self._workspace_status().mark_inbound(team_id)
+            self._workspace_status().mark_inbound(team_id, channel_id)
         except Exception:
             logger.warning(
                 "[Slack] Could not publish workspace inbound receipt",
@@ -870,8 +872,9 @@ class SlackAdapter(BasePlatformAdapter):
         if team_id:
             # Only the exact workspace resolved from the outer Slack envelope
             # may refresh this row. Rejected/ambiguous envelopes never count as
-            # liveness for any installation.
-            self._status_mark_inbound(team_id)
+            # liveness for any installation. channel은 채널별 도달 실측용 —
+            # 없는 이벤트(DM 등)는 workspace 필드만 갱신된다.
+            self._status_mark_inbound(team_id, scoped_event.get("channel"))
         await handler(scoped_event)
         return True
 
@@ -4721,7 +4724,7 @@ class SlackAdapter(BasePlatformAdapter):
         if team_id and channel_id:
             self._learn_channel_team(channel_id, team_id)
         if team_id and team_id in self._team_clients:
-            self._status_mark_inbound(team_id)
+            self._status_mark_inbound(team_id, channel_id)
 
         if slash_name in {"hermes", ""}:
             # Legacy /hermes <subcommand> [args] routing + free-form questions.

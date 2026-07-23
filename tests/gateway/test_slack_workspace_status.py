@@ -88,7 +88,7 @@ def test_receipt_has_exact_schema_private_mode_and_timestamp_order(tmp_path):
         "generated_at",
         "workspaces",
     }
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert payload["agent_key"] == "chami"
     assert [row["workspace_key"] for row in payload["workspaces"]] == [
         "apom",
@@ -103,6 +103,7 @@ def test_receipt_has_exact_schema_private_mode_and_timestamp_order(tmp_path):
             "heartbeat_at",
             "last_inbound_at",
             "error_code",
+            "last_inbound_by_channel",
         }
         assert row["connected"] is True
         assert row["error_code"] is None
@@ -383,3 +384,36 @@ async def test_workspace_set_mismatch_still_blocks_slack_connect(
 
     assert await adapter.connect() is False
     assert adapter._running is False
+
+
+def test_mark_inbound_records_per_channel_and_skips_invalid(tmp_path):
+    writer = _writer(tmp_path)
+    writer.mark_verified("T0TEAM", write=False)
+    writer.mark_verified("T0APOM", write=False)
+    writer.mark_socket_connected()
+    writer.mark_inbound("T0APOM", "C0BH82NCPGF")
+    writer.mark_inbound("T0APOM", None)
+    writer.mark_inbound("T0APOM", "c0lower")
+
+    rows = {row["team_id"]: row for row in _read(writer)["workspaces"]}
+    assert rows["T0APOM"]["last_inbound_by_channel"] == {"C0BH82NCPGF": FIXED_NOW}
+    assert rows["T0TEAM"]["last_inbound_by_channel"] == {}
+
+
+def test_channel_rows_are_capped_by_evicting_oldest(tmp_path):
+    ticks = iter(f"2026-07-23T00:00:{i:02d}+00:00" for i in range(120))
+    writer = SlackWorkspaceStatusWriter(
+        workspace_keys={"T0TEAM": "team"},
+        agent_key="chami",
+        path=tmp_path / "receipt.json",
+        clock=lambda: next(ticks),
+    )
+    writer.mark_verified("T0TEAM", write=False)
+    writer.mark_socket_connected()
+    for i in range(40):
+        writer.mark_inbound("T0TEAM", f"C{i:07d}")
+
+    rows = _read(writer)["workspaces"][0]["last_inbound_by_channel"]
+    assert len(rows) == 32
+    assert "C0000000" not in rows          # 가장 오래된 것부터 축출
+    assert "C0000039" in rows
